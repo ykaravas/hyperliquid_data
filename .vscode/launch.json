@@ -1,0 +1,70 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Export: BTC perps (yesterday)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export",
+                "--coin", "BTC",
+                "--market-type", "perpetuals",
+                "--start", "2026-04-13",
+                "--end", "2026-04-14",
+                "--out-dir", "${workspaceFolder}/data"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Export: HYPE spot (date range)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export",
+                "--coin", "HYPE",
+                "--market-type", "spot",
+                "--start", "2026-04-01",
+                "--end", "2026-04-14",
+                "--out-dir", "${workspaceFolder}/data"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "List markets",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "list-markets",
+                "--start", "2026-04-01",
+                "--end", "2026-04-14"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        }
+    ]
+}

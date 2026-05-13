@@ -2,6 +2,10 @@
 .DS_Store
 data/*
 /*.sql
+.env
+.venv/
+output/
+tmp/
 
 
 # Byte-compiled / optimized / DLL files

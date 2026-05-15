@@ -18,7 +18,7 @@
             "request": "launch",
             "module": "hyperliquid_halo.cli",
             "args": [
-                "export",
+                "export-execs",
                 "--coin", "BTC",
                 "--market-type", "perpetuals",
                 "--start", "2026-04-13",
@@ -37,7 +37,7 @@
             "request": "launch",
             "module": "hyperliquid_halo.cli",
             "args": [
-                "export",
+                "export-execs",
                 "--coin", "HYPE",
                 "--market-type", "spot",
                 "--start", "2026-04-01",
@@ -57,6 +57,41 @@
             "module": "hyperliquid_halo.cli",
             "args": [
                 "list-markets",
+                "--start", "2026-04-01",
+                "--end", "2026-04-14"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Export orders: BTC perps (yesterday)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export-orders",
+                "--coin", "BTC",
+                "--market-type", "perpetuals",
+                "--start", "2026-04-13",
+                "--end", "2026-04-14",
+                "--out-dir", "${workspaceFolder}/data"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "List order coins",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "list-order-coins",
                 "--start", "2026-04-01",
                 "--end", "2026-04-14"
             ],

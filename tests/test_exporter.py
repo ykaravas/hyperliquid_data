@@ -69,7 +69,7 @@ def _make_row(**overrides: Any) -> tuple[Any, ...]:
         "OrderCapacity": "Agency",
         "MatchingOrderCapacity": "Agency",
         "TrdType": "RegularTrade",
-        "Blockchain": "Hyperliquid",
+        "Blockchain": "ethereum",
         "WalletAddress": "0xbuy",
         "SecurityType": "SWAP",
         "ExchangeSymbol": "Hyperliquid:BTC",
@@ -132,9 +132,10 @@ def test_export_to_csv_writes_both_files(
     assert list(aux_rows[0].keys()) == list(AUX_COLUMNS)
     assert len(halo_rows) == 3 == len(aux_rows)
 
-    # Spot row has no PositionEffect -> export view default 'CLOSE' applied.
+    # Spot row has no PositionEffect -> written as empty, never defaulted
+    # (HALO stores empty; the old NULL -> 'CLOSE' defaulting was removed 2026-08-24).
     spot = halo_rows[2]
-    assert spot["PositionEffect"] == "CLOSE"
+    assert spot["PositionEffect"] == ""
     assert spot["SecurityType"] == "SPOT"
 
     # Id matches across halo and aux for row-level joining.
@@ -184,10 +185,3 @@ def test_export_handles_uppercased_cursor_columns(
     assert halo_rows[0]["Side"] == "Buy"
     assert halo_rows[0]["Account"] == "0xbuy"
     assert halo_rows[0]["SecurityType"] == "SWAP"
-
-
-def test_default_position_effect_passthrough() -> None:
-    assert exporter._halo_default_position_effect("OPEN") == "OPEN"
-    assert exporter._halo_default_position_effect("CLOSE") == "CLOSE"
-    assert exporter._halo_default_position_effect(None) == "CLOSE"
-    assert exporter._halo_default_position_effect("") == "CLOSE"

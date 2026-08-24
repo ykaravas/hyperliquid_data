@@ -11,10 +11,16 @@ buyer and seller context (`BUYER_*` / `SELLER_*` columns). HALO v2.1
 expects **one execution record per side**, so each source row is expanded
 into two HALO rows:
 
-- A `Buy` record with `Id = TRADE_ID || '-B'`,
-  `MatchingID = TRADE_ID || '-S'`, and the buyer's attribution fields.
+- A `Buy` record with `Id = REPLACE(UNIQUE_ID, ' ', 'T') || '-B'`,
+  `MatchingID = ... || '-S'`, and the buyer's attribution fields.
 - A `Sell` record mirroring the above with `-S` / `-B` and the seller's
   attribution fields.
+
+Ids are built from `UNIQUE_ID` (`TRADE_ID-COIN-TIMESTAMP`), not bare
+`TRADE_ID`: `TRADE_ID` is only unique per coin, so an all-market export
+would produce colliding ids. The space in `UNIQUE_ID`'s timestamp is
+replaced with `T` so the id carries no whitespace. (Changed 2026-08-24
+to match the production pipeline; earlier exports used `TRADE_ID`.)
 
 `Id` / `MatchingID` cross-link the two records so HALO can reassemble the
 two sides of a given trade.
@@ -39,10 +45,25 @@ limit.
 
 ### 2.1 PositionEffect ambiguity
 
-`BUYER_DIR` / `SELLER_DIR` is one of: `Open Long`, `Open Short`,
-`Close Long`, `Close Short`, `Long > Short`, `Short > Long`. The `>`
-variants are position **flips** where one trade both closes the existing
-position and opens a new one in the opposite direction. For those rows,
+The common `BUYER_DIR` / `SELLER_DIR` values are `Open Long`,
+`Open Short`, `Close Long`, `Close Short`, `Long > Short`,
+`Short > Long` (perps) and `Buy` / `Sell` (spot). The full Allium
+history also carries rarer directions (full-history inventory taken
+2026-08-24): `Settlement` (exchange settlement on delisting, mapped to
+`CLOSE`), the liquidation family (`Liquidated Cross/Isolated
+Long/Short`, `Partial Borrow Liquidation`, `Backstop Borrow
+Liquidation`), `Auto-Deleveraging` (ADL of the liquidated account's
+profitable counterparty), `Spot Dust Conversion` (exchange dust sweeps,
+seen 2024-07 to 2025-03), `Net Child Vaults` (vault-aggregation rows,
+not real executions), and roughly 38.5M NULL-dir sides through
+2025-05-23. This portable exporter includes all of them in the output
+(their context is preserved in aux); only `Open *`, `Close *`, and
+`Settlement` produce a `PositionEffect`, and every other direction
+emits `NULL`. Nothing without clean open/close semantics is guessed.
+
+The `>` variants are position **flips** where one trade both closes the
+existing position and opens a new one in the opposite direction. For
+those rows,
 `PositionEffect` is emitted as `NULL`, and HALO stores it as **empty**:
 there is no defaulting. (An earlier revision of this doc claimed HALO
 applies a `NULL → CLOSE` default; that rule does not exist. Verified
@@ -90,8 +111,8 @@ or similar — **never** in `ContractMultiplier`.
 | HALO column                 | Source (buy side)                            | Notes |
 |-----------------------------|----------------------------------------------|-------|
 | `TransactTime`              | `DATE_PART(EPOCH_MILLISECOND, TIMESTAMP)::BIGINT` | ms since epoch (HALO requirement). |
-| `Id`                        | `TRADE_ID \|\| '-B'`                         | HALO requires per-side unique ids. |
-| `MatchingID`                | `TRADE_ID \|\| '-S'`                         | Cross-reference to the counterparty side. |
+| `Id`                        | `REPLACE(UNIQUE_ID, ' ', 'T') \|\| '-B'`     | HALO requires per-side unique ids; `TRADE_ID` alone collides across coins (see §1). |
+| `MatchingID`                | `REPLACE(UNIQUE_ID, ' ', 'T') \|\| '-S'`     | Cross-reference to the counterparty side. |
 | `OrderID`                   | `BUYER_ORDER_ID::STRING`                     | Required. |
 | `MatchingOrderID`           | `SELLER_ORDER_ID::STRING`                    | Required when `ExecutionType = EXCHANGE`. |
 | `ExecutionType`             | literal `'EXCHANGE'`                         | Hyperliquid is a CLOB exchange. |
@@ -112,7 +133,7 @@ or similar — **never** in `ContractMultiplier`.
 | `MatchingOrderCapacity`     | literal `'Agency'`                           | |
 | `TrdType`                   | literal `'RegularTrade'`                     | Liquidations still emit `RegularTrade`; liquidation context lives in the aux file via `_LiquidatedUser` etc. |
 | `ParentOrderId`             | `BUYER_TWAP_ID` (NULL if blank)              | Groups child executions of a TWAP order. |
-| `Blockchain`                | literal `'Hyperliquid'`                      | |
+| `Blockchain`                | literal `'ethereum'`                         | HALO's supported Blockchain list has no `Hyperliquid` value; `ethereum` is the closest valid one (HL accounts are EVM addresses). Changed 2026-08-24 (was `'Hyperliquid'`, an invalid enum value). |
 | `WalletAddress`             | `BUYER_ADDRESS`                              | |
 | `SecurityType`              | see §2                                       | |
 | `ExchangeSymbol`            | see §2                                       | |
@@ -164,3 +185,44 @@ keyed back to the HALO row via `Id`:
 | `_PerpDex`              | `PERP_DEX`                      | HIP-3 perp dex name. |
 | `_PerpMarketName`       | `PERP_MARKET_NAME`              | HIP-3 market name. |
 | `_IsHip3`               | `IS_HIP3`                       | Flag for HIP-3 custom perp dexes. |
+
+## 5. Production pipeline divergences (defi-hyperliquid-halo, 2026-08-24)
+
+The production Snowflake pipeline (repo `defi-hyperliquid-halo`, deployed via
+Flyway) implements this same mapping but diverges from this portable exporter
+in ways that are deliberate. Recorded here so the two artifacts don't get
+conflated:
+
+- **Eligibility gate.** Production excludes whole trades where either side's
+  direction is a forced closure (`ILIKE '%Liquidat%'`, which covers the
+  borrow-liquidation spellings that don't start with `Liquidated`, plus
+  `Auto-Deleveraging`), a `Net Child Vaults` aggregation row, or a
+  `Spot Dust Conversion`, and drops trades with unresolved symbols. This
+  exporter intentionally keeps all of those rows: it's a research tool, and
+  liquidation context lives in aux.
+- **SQL NULL hazard (fixed in production 2026-08-24).** `IS_HIP3` is NULL on
+  spot rows, so a predicate like `(NOT IS_HIP3 OR PERP_DEX IS NOT NULL)`
+  evaluates NULL and silently drops every spot trade. Production shipped with
+  that bug and delivered zero spot volume until fixed with
+  `NOT (COALESCE(IS_HIP3, FALSE) AND PERP_DEX IS NULL)`. Any predicate
+  touching `IS_HIP3` or the `*_DIR` columns must be NULL-safe.
+- **DQ guard.** Production runs a fail-closed direction whitelist (DQ-7):
+  any batch row whose direction is NULL or outside the known-eligible set
+  (`Open/Close Long/Short`, flips, `Settlement`, `Buy`, `Sell`) aborts the
+  upload. New Hyperliquid direction strings appear over time; the guard
+  forces an explicit mapping decision instead of shipping them unmapped.
+- **SymbolType.** Production emits a per-market `SymbolType` from a seeded
+  500-row map (`R__06b_symbol_type_map.sql`) generated from the
+  `hyperliquid_perps_universe.xlsx` workbook's curated SymbolType column
+  (Crypto / Memecoin / Stablecoin / Equity / Commodities / FX / FixedIncome /
+  Exotics). Spot rows are always `Crypto` (structural: HL spot is
+  crypto-only); a perp missing from the map ships with SymbolType empty, no
+  guessed fallback. This exporter does not emit SymbolType (the field is
+  optional in HALO); port the map if that changes.
+- **HIP-3 symbols.** Production embeds the dex in `Symbol` for HIP-3 markets
+  (`SP500-XYZ/USDC`) so the same underlying on two dexes can't collide; this
+  exporter emits plain `TOKEN_A/TOKEN_B`, so e.g. `GOOGL/USDC` is ambiguous
+  across dexes (use `_Coin` / `_PerpDex` in aux to disambiguate).
+- **OrderID suffixes.** Production appends `-B` / `-S` to `OrderID` /
+  `MatchingOrderID`. This exporter keeps raw Hyperliquid order ids so
+  executions stay joinable to its own orders feed (`halo_orders.csv`).

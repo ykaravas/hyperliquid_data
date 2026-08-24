@@ -53,17 +53,6 @@ def _row_to_dict(columns: Sequence[str], row: Sequence[Any]) -> dict[str, Any]:
     return dict(zip(columns, row, strict=True))
 
 
-def _halo_default_position_effect(value: Any) -> Any:
-    """Apply the HALO export-view default: NULL ``PositionEffect`` -> 'CLOSE'.
-
-    Matches the behaviour of ``11_halo_export_view.sql`` on the reference
-    project so that ambiguous position flips and spot trades still produce
-    non-null values when written to the HALO CSV. Only applied to the HALO
-    file, not the aux file.
-    """
-    return value if value not in (None, "") else "CLOSE"
-
-
 def export_to_csv(
     params: QueryParams,
     out_dir: Path,
@@ -123,10 +112,11 @@ def export_to_csv(
                     break
                 for raw in batch:
                     record = _row_to_dict(cursor_columns, raw)
+                    # NULL PositionEffect (spot rows, flips, other directions with no
+                    # clean open/close semantics) is written as empty on purpose --
+                    # HALO stores it as empty and applies no default, and forcing
+                    # 'CLOSE' (removed 2026-08-24) mislabeled those rows.
                     halo_row = {col: record.get(halo_lookup[col]) for col in HALO_COLUMNS}
-                    halo_row["PositionEffect"] = _halo_default_position_effect(
-                        halo_row["PositionEffect"]
-                    )
                     aux_row = {col: record.get(aux_lookup[col]) for col in AUX_COLUMNS}
                     halo_writer.writerow(halo_row)
                     aux_writer.writerow(aux_row)

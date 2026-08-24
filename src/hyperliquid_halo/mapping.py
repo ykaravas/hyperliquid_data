@@ -214,8 +214,12 @@ def _side_cte(
     return f"""{name} AS (
     SELECT
         DATE_PART(EPOCH_MILLISECOND, TIMESTAMP)::BIGINT                AS TransactTime,
-        TRADE_ID || '{id_suffix}'                                      AS Id,
-        TRADE_ID || '{match_suffix}'                                   AS MatchingID,
+        -- UNIQUE_ID (TRADE_ID-COIN-TIMESTAMP) is globally unique; TRADE_ID alone is
+        -- only unique per coin, so an all-market export would hand HALO colliding
+        -- Ids. The space in UNIQUE_ID's timestamp is replaced with 'T' so the id
+        -- carries no whitespace (same scheme as the production pipeline).
+        REPLACE(UNIQUE_ID, ' ', 'T') || '{id_suffix}'                  AS Id,
+        REPLACE(UNIQUE_ID, ' ', 'T') || '{match_suffix}'               AS MatchingID,
         {self_prefix}_ORDER_ID::STRING                                 AS OrderID,
         {other_prefix}_ORDER_ID::STRING                                AS MatchingOrderID,
         'EXCHANGE'                                                     AS ExecutionType,
@@ -240,14 +244,20 @@ def _side_cte(
             WHEN {self_prefix}_TWAP_ID IS NOT NULL AND {self_prefix}_TWAP_ID != ''
             THEN {self_prefix}_TWAP_ID::STRING
         END                                                            AS ParentOrderId,
-        'Hyperliquid'                                                  AS Blockchain,
+        -- HALO's Blockchain enum has no 'Hyperliquid' value; 'ethereum' is the
+        -- closest valid one (HL accounts are EVM addresses).
+        'ethereum'                                                     AS Blockchain,
         {self_prefix}_ADDRESS                                          AS WalletAddress,
         CASE WHEN MARKET_TYPE = 'perpetuals' THEN 'SWAP' ELSE 'SPOT' END AS SecurityType,
-        'Hyperliquid:' || COALESCE(PAIR, COIN)                         AS ExchangeSymbol,
+        'Hyperliquid:' || COALESCE(NULLIF(PAIR, ''), COIN)             AS ExchangeSymbol,
+        -- 'Settlement' is an exchange settlement of the position (delisting) -> CLOSE.
+        -- Every other direction (flips, liquidations, ADL, dust conversions, vault
+        -- aggregation) has no clean open/close semantics and stays NULL -- the empty
+        -- value is preserved into halo.csv, never defaulted (HALO stores it as empty).
         CASE
             WHEN MARKET_TYPE = 'perpetuals' AND {self_prefix}_DIR IN ('Open Long', 'Open Short')
                 THEN 'OPEN'
-            WHEN MARKET_TYPE = 'perpetuals' AND {self_prefix}_DIR IN ('Close Long', 'Close Short')
+            WHEN MARKET_TYPE = 'perpetuals' AND {self_prefix}_DIR IN ('Close Long', 'Close Short', 'Settlement')
                 THEN 'CLOSE'
         END                                                            AS PositionEffect,
         CASE WHEN MARKET_TYPE = 'perpetuals' THEN '1' END               AS ContractMultiplier,

@@ -97,7 +97,9 @@ template (`mapping._side_cte`) that takes parameters for which
 prefix is "self" and which is "other":
 
 - `buy_side`: `self=BUYER`, `other=SELLER`, `Side='Buy'`,
-  `Id=TRADE_ID||'-B'`, `MatchingID=TRADE_ID||'-S'`.
+  `Id=REPLACE(UNIQUE_ID,' ','T')||'-B'`, `MatchingID=...||'-S'`.
+  (`UNIQUE_ID`, not `TRADE_ID`: trade ids are only unique per coin, so
+  all-market exports would collide; see the mapping doc §1.)
 - `sell_side`: mirror with the prefixes and id suffixes flipped.
 
 `MatchingID` ↔ `Id` cross-link the two HALO rows so surveillance can
@@ -105,20 +107,28 @@ reassemble the trade. The shared CTE template guarantees the two sides
 cannot drift out of sync — there is exactly one definition of how a
 side row is built.
 
-### 3.1 PositionEffect — flips emit NULL → defaulted to CLOSE
+### 3.1 PositionEffect — no defaulting; empty means empty
 
-`{side}_DIR` is one of: `Open Long`, `Open Short`, `Close Long`,
-`Close Short`, `Long > Short`, `Short > Long`. The `>` variants are
-**position flips** where one trade both closes the existing position
-and opens a new one in the opposite direction. The SQL emits `NULL`
-for those rows; the exporter then applies a Python-side defaulting
-rule (`_halo_default_position_effect`) that maps `NULL → 'CLOSE'`
-only in the HALO file (the aux file preserves the raw NULL).
+The SQL maps `Open Long`/`Open Short` to `OPEN` and `Close Long`/
+`Close Short`/`Settlement` to `CLOSE`, and emits `NULL` for everything
+else: spot rows, position flips (`Long > Short` / `Short > Long`), and
+the rare forced-fill directions (liquidations, ADL, dust conversions;
+full inventory in `hl_execs_halo_mapping.md` §2.1). The exporter writes
+those NULLs to `halo.csv` as empty values.
+
+There used to be a Python-side rule (`_halo_default_position_effect`)
+that forced `NULL → 'CLOSE'` in the HALO file. It was removed on
+2026-08-24: HALO applies no such default (verified against
+`solidus_uat_eu.strict_events_executions`, where NULL uploads land as
+empty), so the rule was actively mislabeling every spot row and every
+flip as `CLOSE`. Nothing without clean open/close semantics gets a
+guessed value.
 
 Splitting flips into two HALO rows is structurally possible but would
-change row counts and add real complexity for marginal benefit. The
-single-row-with-NULL-then-default approach is the deliberate choice;
-see `hl_execs_halo_mapping.md` §2.1.
+change row counts and add real complexity for marginal benefit; a
+dominant-leg labeling via `{side}_START_POSITION` is the documented
+option if surveillance ever needs flips categorized (see
+`hl_execs_halo_mapping.md` §2.1).
 
 ### 3.2 IsMaker — non-HALO column on `halo.csv`
 

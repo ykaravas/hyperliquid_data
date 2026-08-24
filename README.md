@@ -58,18 +58,18 @@ python -m hyperliquid_halo.cli list-markets \
 python -m hyperliquid_halo.cli export-execs \
     --start 2026-04-01 --end 2026-04-14 \
     --coin BTC --market-type perpetuals \
-    --out-dir ./data/btc_perps_202604
+    --out-dir ./output/btc_perps_202604
 
 # Export a spot market (HYPE/USDC)
 python -m hyperliquid_halo.cli export-execs \
     --start 2026-04-01 --end 2026-04-14 \
     --token-a HYPE --token-b USDC --market-type spot \
-    --out-dir ./data/hype_spot_202604
+    --out-dir ./output/hype_spot_202604
 
 # Export ALL markets (both spot and perps, every coin)
 python -m hyperliquid_halo.cli export-execs \
     --start 2026-04-13 --end 2026-04-14 \
-    --out-dir ./data/all_202604_13
+    --out-dir ./output/all_202604_13
 ```
 
 #### Filter options on `export-execs`
@@ -82,7 +82,7 @@ python -m hyperliquid_halo.cli export-execs \
 | `--market-type`  | `spot` or `perpetuals`. Omit for both.                                         |
 | `--token-a`      | `TOKEN_A_SYMBOL` filter — base token (useful for spot).                        |
 | `--token-b`      | `TOKEN_B_SYMBOL` filter — quote token (useful for spot).                       |
-| `--out-dir`      | Directory for `halo.csv` + `aux.csv` (default `./data`).                       |
+| `--out-dir`      | Directory for `halo.csv` + `aux.csv` (default `./output`).                       |
 
 Filters are ANDed. Passing *nothing* but a date range returns every trade
 in the range.
@@ -99,19 +99,19 @@ python -m hyperliquid_halo.cli list-order-coins \
 python -m hyperliquid_halo.cli export-orders \
     --start 2026-04-13 --end 2026-04-14 \
     --coin BTC --market-type perpetuals \
-    --out-dir ./data/btc_perps_202604
+    --out-dir ./output/btc_perps_202604
 
 # Export all spot order activity for one day
 python -m hyperliquid_halo.cli export-orders \
     --start 2026-04-13 --end 2026-04-14 \
     --market-type spot \
-    --out-dir ./data/spot_orders_202604_13
+    --out-dir ./output/spot_orders_202604_13
 
 # Export every order touching a specific user address
 python -m hyperliquid_halo.cli export-orders \
     --start 2026-04-13 --end 2026-04-14 \
     --user 0xabc...def \
-    --out-dir ./data/user_abc_202604_13
+    --out-dir ./output/user_abc_202604_13
 ```
 
 #### Filter options on `export-orders`
@@ -123,7 +123,7 @@ python -m hyperliquid_halo.cli export-orders \
 | `--coin`         | Allium `COIN` filter (`BTC`, `kPEPE`, `xyz:SP500`, `@107`, `PURR/USDC`).                      |
 | `--market-type`  | `spot` (matches `@N`-prefixed and `base/quote` COINs) or `perpetuals` (everything else). Inferred from `COIN` shape — `RAW.ORDERS` has no native market-type column. |
 | `--user`         | Filter by the on-chain `USER` address (useful for per-account analysis).                      |
-| `--out-dir`      | Directory for `halo_orders.csv` + `aux_orders.csv` (default `./data`).                        |
+| `--out-dir`      | Directory for `halo_orders.csv` + `aux_orders.csv` (default `./output`).                        |
 
 `filled` order rows are filtered at source — fills are covered by the
 trades pipeline and HALO order `Status` does not accept `Filled`. `Vault
@@ -136,7 +136,7 @@ the full list of decisions and deferred work.
 The project integrates with Solidus's `validate-schema` skill:
 
 ```bash
-validate-schema --csv data/btc_perps_202604/halo.csv
+validate-schema --csv output/btc_perps_202604/halo.csv
 ```
 
 This runs the HALO v2.1 validator (required columns, enum values) against

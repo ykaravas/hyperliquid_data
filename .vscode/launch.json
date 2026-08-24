@@ -23,7 +23,7 @@
                 "--market-type", "perpetuals",
                 "--start", "2026-04-13",
                 "--end", "2026-04-14",
-                "--out-dir", "${workspaceFolder}/data"
+                "--out-dir", "${workspaceFolder}/output"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
@@ -42,7 +42,7 @@
                 "--market-type", "spot",
                 "--start", "2026-04-01",
                 "--end", "2026-04-14",
-                "--out-dir", "${workspaceFolder}/data"
+                "--out-dir", "${workspaceFolder}/output"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
@@ -77,7 +77,7 @@
                 "--market-type", "perpetuals",
                 "--start", "2026-04-13",
                 "--end", "2026-04-14",
-                "--out-dir", "${workspaceFolder}/data"
+                "--out-dir", "${workspaceFolder}/output"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",

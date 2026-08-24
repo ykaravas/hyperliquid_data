@@ -30,7 +30,7 @@ two sides of a given trade.
 | `Symbol`              | `{TOKEN_A_SYMBOL}/{TOKEN_B_SYMBOL}` (e.g. `BTC/USDC`) | Same (e.g. `UBTC/USDC`, `HYPE/USDC`) |
 | `ExchangeSymbol`      | `Hyperliquid:{PAIR}` (falls back to `{COIN}`) | Same                                         |
 | `ContractMultiplier`  | `'1'` (required for SWAP)              | `NULL`                                             |
-| `PositionEffect`      | `OPEN` / `CLOSE` derived from `{side}_DIR` | `NULL` (not applicable — defaults to `CLOSE` per the HALO CSV null convention) |
+| `PositionEffect`      | `OPEN` / `CLOSE` derived from `{side}_DIR` | `NULL` (not applicable; HALO stores an empty position effect, see §2.1) |
 
 `Symbol` is identical across market types — `SecurityType` (`SWAP` vs
 `SPOT`) is what distinguishes them downstream. HALO caps `Symbol` at 41
@@ -43,10 +43,18 @@ limit.
 `Close Long`, `Close Short`, `Long > Short`, `Short > Long`. The `>`
 variants are position **flips** where one trade both closes the existing
 position and opens a new one in the opposite direction. For those rows,
-`PositionEffect` is emitted as `NULL` and the HALO defaulting rule
-(`NULL → CLOSE`) lands them in the CSV as `CLOSE`. Splitting a flip into
-two separate HALO rows is technically possible but materially more
-complex and changes row counts.
+`PositionEffect` is emitted as `NULL`, and HALO stores it as **empty**:
+there is no defaulting. (An earlier revision of this doc claimed HALO
+applies a `NULL → CLOSE` default; that rule does not exist. Verified
+2026-08-24 against `solidus_uat_eu.strict_events_executions`: flip rows
+land with `position_effect = ''` while adjacent Open/Close rows land as
+`OPEN`/`CLOSE`, and the v2.1 schema defines no default for the field.)
+So flips, roughly 2.6% of perp execution sides, carry no open/close
+marker in HALO. If surveillance logic ever keys on `PositionEffect =
+OPEN`, consider labeling flips by their dominant leg using
+`{side}_START_POSITION` (OPEN when `AMOUNT - |start_position| >
+|start_position|`). Splitting a flip into two separate HALO rows is
+technically possible but materially more complex and changes row counts.
 
 ### 2.2 `ContractMultiplier` is not leverage
 

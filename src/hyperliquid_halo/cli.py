@@ -13,12 +13,12 @@ Typical usage::
     python -m hyperliquid_halo.cli export-execs \\
         --start 2026-04-01 --end 2026-04-14 \\
         --coin BTC --market-type perpetuals \\
-        --out-dir ./data/btc_perps_202604
+        --out-dir ./output/btc_perps_202604
 
     python -m hyperliquid_halo.cli export-orders \\
         --start 2026-04-01 --end 2026-04-14 \\
         --coin BTC --market-type perpetuals \\
-        --out-dir ./data/btc_perps_202604
+        --out-dir ./output/btc_perps_202604
 
     python -m hyperliquid_halo.cli list-markets \\
         --start 2026-04-01 --end 2026-04-14
@@ -104,7 +104,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option("--token-b", default=None,
               help="Filter by TOKEN_B_SYMBOL (quote token). Handy for spot markets.")
 @click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path),
-              default=Path("./data"), show_default=True,
+              default=Path("./output"), show_default=True,
               help="Directory to write halo.csv and aux.csv into.")
 @click.option("--halo-filename", default="halo.csv", show_default=True)
 @click.option("--aux-filename", default="aux.csv", show_default=True)
@@ -192,7 +192,7 @@ def list_markets_cmd(start_str: str, end_str: str, top: int) -> None:
               help="Filter by on-chain user address (the RAW.ORDERS USER column). "
                    "Useful for per-account analysis.")
 @click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path),
-              default=Path("./data"), show_default=True,
+              default=Path("./output"), show_default=True,
               help="Directory to write halo_orders.csv and aux_orders.csv into.")
 @click.option("--halo-filename", default="halo_orders.csv", show_default=True)
 @click.option("--aux-filename", default="aux_orders.csv", show_default=True)

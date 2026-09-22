@@ -34,6 +34,7 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+from .dq import DqFailure
 from .exporter import export_to_csv, list_markets
 from .mapping import QueryParams
 from .orders_exporter import export_orders_to_csv, list_order_coins
@@ -108,6 +109,23 @@ def cli(ctx: click.Context, verbose: bool) -> None:
               help="Directory to write halo.csv and aux.csv into.")
 @click.option("--halo-filename", default="halo.csv", show_default=True)
 @click.option("--aux-filename", default="aux.csv", show_default=True)
+@click.option("--include-ineligible", is_flag=True, default=False,
+              help="Skip the production eligibility gate: also export liquidations, "
+                   "auto-deleveraging, vault aggregation rows, dust sweeps and trades "
+                   "with unresolved symbols (research use; not what production ships).")
+@click.option("--halo-strict", is_flag=True, default=False,
+              help="Emit exactly what production ships to HALO: OrderID/MatchingOrderID "
+                   "carry the -B/-S side suffix, no IsMaker column, DQ failures remove the "
+                   "files, and output is packaged as per-date parts (see --max-file-mb). "
+                   "Cannot be combined with --include-ineligible.")
+@click.option("--max-file-mb", type=click.FloatRange(min=1), default=None,
+              help="Package the HALO output as per-transact-date part files capped at this "
+                   "many MB, named like production's "
+                   "({prefix}_LINKED_PRIVATE_EXECUTION_V2_DDMMYYYY_partN.csv; aux parts "
+                   "under aux/). Default: 250 with --halo-strict (production's cap), "
+                   "otherwise single files.")
+@click.option("--file-prefix", default="sdny", show_default=True,
+              help="File-name prefix for packaged parts (production uses the tenant name).")
 def export_execs_cmd(
     start_str: str,
     end_str: str,
@@ -118,8 +136,14 @@ def export_execs_cmd(
     out_dir: Path,
     halo_filename: str,
     aux_filename: str,
+    include_ineligible: bool,
+    halo_strict: bool,
+    max_file_mb: float | None,
+    file_prefix: str,
 ) -> None:
     """Export a HALO v2.1 Execution Data CSV for the given date range and market filters."""
+    if halo_strict and include_ineligible:
+        raise click.UsageError("--halo-strict cannot be combined with --include-ineligible.")
     params = QueryParams(
         start_ts=_parse_day(start_str),
         end_ts=_parse_day(end_str),
@@ -127,22 +151,43 @@ def export_execs_cmd(
         market_type=market_type.lower() if market_type else None,
         token_a=token_a,
         token_b=token_b,
+        include_ineligible=include_ineligible,
+        halo_strict=halo_strict,
     )
     click.echo(
         f"Exporting {params.start_ts.date()} .. {params.end_ts.date()} "
-        f"(coin={coin or 'ALL'}, market_type={market_type or 'ALL'}) -> {out_dir}"
+        f"(coin={coin or 'ALL'}, market_type={market_type or 'ALL'}, "
+        f"eligibility={'off' if include_ineligible else 'production'}, "
+        f"mode={'halo-strict' if halo_strict else 'default'}) -> {out_dir}"
     )
-    result = export_to_csv(
-        params,
-        out_dir=out_dir,
-        halo_filename=halo_filename,
-        aux_filename=aux_filename,
-    )
-    click.echo(
-        f"Wrote {result.row_count} rows:\n"
-        f"  HALO: {result.halo_path}\n"
-        f"  AUX:  {result.aux_path}"
-    )
+    try:
+        result = export_to_csv(
+            params,
+            out_dir=out_dir,
+            halo_filename=halo_filename,
+            aux_filename=aux_filename,
+            max_part_mb=max_file_mb,
+            file_prefix=file_prefix,
+        )
+    except DqFailure as exc:
+        # Production aborts the upload on a DQ failure; a strict export does
+        # the same and leaves no files behind.
+        click.echo(f"{exc}\n{exc.report.describe()}", err=True)
+        raise SystemExit(1) from exc
+    if len(result.halo_paths) == 1:
+        click.echo(
+            f"Wrote {result.row_count} rows:\n"
+            f"  HALO: {result.halo_path}\n"
+            f"  AUX:  {result.aux_path}"
+        )
+    else:
+        click.echo(
+            f"Wrote {result.row_count} rows as {len(result.halo_paths)} HALO part file(s) "
+            f"under {out_dir} (aux parts under {out_dir / 'aux'}):"
+        )
+        for path in result.halo_paths:
+            click.echo(f"  {path.name}  ({path.stat().st_size / 1e6:.1f} MB)")
+    click.echo(result.dq_report.describe())
 
 
 @cli.command("list-markets")
@@ -196,6 +241,10 @@ def list_markets_cmd(start_str: str, end_str: str, top: int) -> None:
               help="Directory to write halo_orders.csv and aux_orders.csv into.")
 @click.option("--halo-filename", default="halo_orders.csv", show_default=True)
 @click.option("--aux-filename", default="aux_orders.csv", show_default=True)
+@click.option("--spot-lookback-days", type=click.IntRange(min=0), default=30, show_default=True,
+              help="Days before --start to scan DEX.TRADES when resolving @N spot pair ids "
+                   "to token symbols (e.g. @107 -> HYPE/USDC). Pairs with no trade in the "
+                   "window keep an @N/USDC placeholder and are listed in a warning.")
 def export_orders_cmd(
     start_str: str,
     end_str: str,
@@ -205,6 +254,7 @@ def export_orders_cmd(
     out_dir: Path,
     halo_filename: str,
     aux_filename: str,
+    spot_lookback_days: int,
 ) -> None:
     """Export a HALO v2.1 Order Data CSV for the given date range and filters.
 
@@ -218,6 +268,7 @@ def export_orders_cmd(
         coin=coin,
         market_type=market_type.lower() if market_type else None,
         user=user_addr,
+        spot_lookback_days=spot_lookback_days,
     )
     click.echo(
         f"Exporting orders {params.start_ts.date()} .. {params.end_ts.date()} "
@@ -235,6 +286,14 @@ def export_orders_cmd(
         f"  HALO: {result.halo_path}\n"
         f"  AUX:  {result.aux_path}"
     )
+    if result.unresolved_spot_rows:
+        click.echo(
+            f"WARNING: {result.unresolved_spot_rows} rows on "
+            f"{len(result.unresolved_spot_coins)} spot pair(s) kept the @N/USDC placeholder "
+            f"Symbol (no trade in the {spot_lookback_days}-day lookback): "
+            f"{', '.join(result.unresolved_spot_coins)}",
+            err=True,
+        )
 
 
 @cli.command("list-order-coins")

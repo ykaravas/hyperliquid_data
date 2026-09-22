@@ -18,17 +18,28 @@ rationale, including the §8 decisions log that drives:
 * ``Stop Market`` and ``Take Profit Market`` both map to ``StopLoss`` (HALO
   has no take-profit enum); ``Stop Limit`` and ``Take Profit Limit`` both
   map to ``LimitToStop``. Direction is implicit in ``StopPx`` vs. mid.
-* HIP-3 ``xyz:*`` identifiers are kept verbatim in ``Symbol`` to avoid
-  collisions across builder-deployed perp dexes.
-* ``@N`` spot pair identifiers emit ``{COIN}/USDC`` as a placeholder.
-  Real ``@N → base`` resolution is deferred.
+* HIP-3 ``{dex}:{market}`` identifiers emit ``{market}-{DEX}/{quote}``
+  (``xyz:TSLA`` → ``TSLA-XYZ/USDC``), the same symbology the executions
+  feed and the production pipeline use, so orders and executions of one
+  contract share a HALO ``Symbol`` and two builder dexes never collide.
+  The quote token is the dex's collateral (:data:`HIP3_DEX_QUOTE_TOKEN`).
+* ``@N`` spot pair identifiers are resolved to ``{TOKEN_A}/{TOKEN_B}``
+  (``@107`` → ``HYPE/USDC``) through a lookback join on ``DEX.TRADES``,
+  the same strings the executions feed emits, so both feeds share one
+  ``Symbol`` and ``ExchangeSymbol`` per spot pair. A pair with no trade in
+  the lookback keeps the ``{COIN}/USDC`` placeholder.
+* ``Blockchain`` is ``ethereum`` (HALO's enum has no Hyperliquid value)
+  and ``SymbolType`` comes from the same seeded per-market map as the
+  executions feed, so both feeds describe an instrument identically.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+
+from .symbol_type_map import render_values_rows
 
 HALO_ORDER_COLUMNS: tuple[str, ...] = (
     "TransactTime",
@@ -56,6 +67,7 @@ HALO_ORDER_COLUMNS: tuple[str, ...] = (
     "SecurityType",
     "ExchangeSymbol",
     "ContractMultiplier",
+    "SymbolType",
 )
 """HALO v2.1 order columns emitted in halo_orders.csv, in output order.
 
@@ -119,6 +131,12 @@ class OrdersQueryParams:
             ``base/quote`` → spot; everything else → perpetuals.
         user: Optional on-chain address filter (matches the ``USER``
             column). Useful for per-account analysis.
+        spot_lookback_days: How far before ``start_ts`` the ``@N`` spot-pair
+            lookup scans ``DEX.TRADES`` for a resolving trade. The
+            ``@N`` → tokens mapping is fixed per index, so any trade in the
+            window resolves the pair; a pair that did not trade in
+            ``[start_ts - lookback, end_ts)`` keeps the ``@N/USDC``
+            placeholder. Default 30.
     """
 
     start_ts: datetime
@@ -126,6 +144,7 @@ class OrdersQueryParams:
     coin: str | None = None
     market_type: str | None = None
     user: str | None = None
+    spot_lookback_days: int = 30
 
     def __post_init__(self) -> None:
         if self.market_type is not None and self.market_type not in ("spot", "perpetuals"):
@@ -135,6 +154,10 @@ class OrdersQueryParams:
         if self.end_ts <= self.start_ts:
             raise ValueError(
                 f"end_ts ({self.end_ts}) must be strictly greater than start_ts ({self.start_ts})"
+            )
+        if self.spot_lookback_days < 0:
+            raise ValueError(
+                f"spot_lookback_days must be >= 0, got {self.spot_lookback_days}"
             )
 
 
@@ -172,6 +195,7 @@ def build_orders_query(params: OrdersQueryParams) -> tuple[str, dict[str, Any]]:
     binds: dict[str, Any] = {
         "start_ts": _as_utc(params.start_ts),
         "end_ts": _as_utc(params.end_ts),
+        "spot_lookup_start": _as_utc(params.start_ts) - timedelta(days=params.spot_lookback_days),
     }
 
     filters: list[str] = []
@@ -187,18 +211,56 @@ def build_orders_query(params: OrdersQueryParams) -> tuple[str, dict[str, Any]]:
         binds["user"] = params.user
 
     extra_filters = "\n          ".join(filters)
-    sql = _SQL_TEMPLATE.format(extra_filters=extra_filters)
+    sql = _SQL_TEMPLATE.format(
+        symbol_type_values=render_values_rows(),
+        extra_filters=extra_filters,
+    )
     return sql, binds
 
 
+HIP3_DEX_QUOTE_TOKEN: dict[str, str] = {
+    "xyz": "USDC",
+    "io": "USDC",
+    "para": "USDC",
+    "mkts": "USDC",
+    "abcd": "USDC",
+    "hyna": "USDE",
+    "km": "USDH",
+    "flx": "USDH",
+    "vntl": "USDH",
+    "cash": "USDT0",
+}
+"""Collateral (quote) token per HIP-3 perp dex, keyed by the lowercase dex
+prefix of ``COIN``. ``RAW.ORDERS`` carries no token symbols, so the quote side
+of a HIP-3 ``Symbol`` has to come from here; the executions feed gets it from
+Allium's ``TOKEN_B_SYMBOL`` and this map must agree with it so both feeds
+emit one ``Symbol`` per contract. Verified against ``DEX.TRADES`` for xyz,
+io, para, mkts (USDC) and hyna (USDE) on 2026-09-21; km/flx/vntl (USDH),
+cash (USDT0) and abcd (USDC) come from each dex's ``meta.collateralToken``
+in the 2026-08-23 universe snapshot. A dex missing from this map falls back
+to USDC; add new dexes here when they list.
+"""
+
+_HIP3_QUOTE_EXPR = "CASE LOWER(SPLIT_PART(COIN, ':', 1))\n" + "".join(
+    f"            WHEN '{dex}' THEN '{quote}'\n" for dex, quote in HIP3_DEX_QUOTE_TOKEN.items()
+) + "            ELSE 'USDC'\n        END"
+
 # Symbol derivation: see §3 of hl_orders_halo_mapping.md.
-# Plain perps (BTC), k-prefix (kPEPE), HIP-3 (xyz:SP500) → `{COIN}/USDC`.
 # Spot pairs already containing `/` (PURR/USDC) → pass through.
-# @N spot indices → `{COIN}/USDC` placeholder (real resolution deferred).
+# @N spot indices → `{TOKEN_A}/{TOKEN_B}` resolved from DEX.TRADES via the
+#   spot_pairs CTE (same strings as the executions feed); `{COIN}/USDC`
+#   placeholder when the pair did not trade in the lookback window.
+# HIP-3 `{dex}:{market}` (xyz:TSLA) → `{market}-{DEX}/{quote}` (TSLA-XYZ/USDC),
+#   matching the executions feed / production `TOKEN_A-DEX/TOKEN_B` form.
+# Plain perps (BTC), k-prefix (kPEPE) → `{COIN}/USDC`.
 # Note: literal `%` is doubled to `%%` so the Snowflake connector's pyformat
 # preprocessor passes it through (single `%` triggers placeholder substitution).
-_SYMBOL_EXPR = """CASE
+_SYMBOL_EXPR = f"""CASE
             WHEN COIN LIKE '%%/%%' THEN COIN
+            WHEN COIN LIKE '@%%' THEN COALESCE(sp.token_a || '/' || sp.token_b, COIN || '/USDC')
+            WHEN COIN LIKE '%%:%%'
+                THEN SPLIT_PART(COIN, ':', 2) || '-' || UPPER(SPLIT_PART(COIN, ':', 1)) || '/' ||
+                     {_HIP3_QUOTE_EXPR}
             ELSE COIN || '/USDC'
         END"""
 
@@ -255,6 +317,12 @@ _STOPPX_EXPR = """CASE WHEN IS_TRIGGER THEN TRIGGER_PRICE END"""
 # ContingencyType: OCO when the order is a TP/SL bracket (see §5.2).
 _CONTINGENCY_EXPR = """CASE WHEN IS_TAKE_PROFIT_OR_STOP_LOSS THEN 'OCO' END"""
 
+# SymbolType: spot is crypto-only on Hyperliquid, so spot rows are always
+# 'Crypto'. Perps take the seeded per-market value keyed on COIN (BTC,
+# xyz:TSLA) and nothing else: an unmapped perp emits NULL, never a guess.
+# Same policy as the executions feed and production.
+_SYMBOL_TYPE_EXPR = f"""CASE WHEN {_IS_SPOT_EXPR} THEN 'Crypto' ELSE m.symbol_type END"""
+
 # TransactTime: original placement for `open`; status-change time otherwise.
 _TRANSACT_TIME_EXPR = """CASE WHEN STATUS = 'open'
             THEN DATE_PART(EPOCH_MILLISECOND, ORDER_TIMESTAMP)::BIGINT
@@ -273,7 +341,31 @@ _CUMQTY_EXPR = """TO_VARCHAR(
         )"""
 
 
-_SQL_TEMPLATE = f"""WITH filtered AS (
+_SQL_TEMPLATE = f"""WITH symbol_type_map AS (
+    SELECT map_coin, symbol_type FROM VALUES
+        {{symbol_type_values}}
+    AS t(map_coin, symbol_type)
+),
+-- @N spot pair index -> token symbols, taken from Allium's own enrichment of
+-- DEX.TRADES so the strings equal what the executions feed emits. The mapping
+-- is fixed per index (a spot index never changes pair), so any trade in the
+-- lookback window resolves it; ANY_VALUE is safe.
+spot_pairs AS (
+    SELECT
+        COIN                          AS spot_coin,
+        ANY_VALUE(TOKEN_A_SYMBOL)     AS token_a,
+        ANY_VALUE(TOKEN_B_SYMBOL)     AS token_b,
+        ANY_VALUE(NULLIF(PAIR, ''))   AS pair
+    FROM ALLIUM_HYPERLIQUID.DEX.TRADES
+    WHERE MARKET_TYPE = 'spot'
+      AND COIN LIKE '@%%'
+      AND TOKEN_A_SYMBOL IS NOT NULL
+      AND TOKEN_B_SYMBOL IS NOT NULL
+      AND TIMESTAMP >= %(spot_lookup_start)s
+      AND TIMESTAMP <  %(end_ts)s
+    GROUP BY COIN
+),
+filtered AS (
     SELECT *
     FROM ALLIUM_HYPERLIQUID.RAW.ORDERS
     WHERE ORDER_TIMESTAMP >= %(start_ts)s
@@ -307,11 +399,14 @@ SELECT
     {_CONTINGENCY_EXPR}                                                AS ContingencyType,
     'Hyperliquid'                                                      AS ExVenue,
     {_TRDTYPE_EXPR}                                                    AS TrdType,
-    'hyperliquid'                                                      AS Blockchain,
+    -- HALO's Blockchain enum has no 'Hyperliquid' value; 'ethereum' is the
+    -- closest valid one (HL accounts are EVM addresses). Same as executions.
+    'ethereum'                                                         AS Blockchain,
     "USER"                                                             AS WalletAddress,
     CASE WHEN {_IS_SPOT_EXPR} THEN 'SPOT' ELSE 'SWAP' END               AS SecurityType,
-    'Hyperliquid:' || COIN                                             AS ExchangeSymbol,
+    'Hyperliquid:' || COALESCE(sp.pair, COIN)                          AS ExchangeSymbol,
     CASE WHEN {_IS_SPOT_EXPR} THEN NULL ELSE '1' END                    AS ContractMultiplier,
+    {_SYMBOL_TYPE_EXPR}                                                AS SymbolType,
 
     -- Supplementary (aux) fields ------------------------------------------
     UNIQUE_ID                                                          AS _UniqueId,
@@ -332,6 +427,8 @@ SELECT
     DATE_PART(EPOCH_MILLISECOND, ORDER_TIMESTAMP)::BIGINT              AS _OrderTimestamp,
     DATE_PART(EPOCH_MILLISECOND, STATUS_CHANGE_TIMESTAMP)::BIGINT      AS _StatusChangeTimestamp
 FROM filtered
+LEFT JOIN symbol_type_map m ON m.map_coin = filtered.COIN
+LEFT JOIN spot_pairs sp ON sp.spot_coin = filtered.COIN
 ORDER BY TransactTime, Id
 """
 

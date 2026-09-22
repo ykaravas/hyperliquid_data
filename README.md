@@ -14,6 +14,20 @@ Up to four CSV files are emitted, two per feed:
 | `halo_orders.csv` | `RAW.ORDERS`  | Strict HALO v2.1 Order Data upload file (one row per status-change event).                   |
 | `aux_orders.csv`  | `RAW.ORDERS`  | Hyperliquid order extras (raw status / side / TIF, trigger details, TP/SL children, builder fees) joined to `halo_orders.csv` on `(Id, TransactTime)`. |
 
+Every executions export also runs production's nine data-quality checks
+(DQ-1..DQ-9) over the written rows and prints the report; under
+`--halo-strict` a failing check removes the files and exits non-zero,
+exactly as production ships nothing when DQ fails.
+
+The HALO files carry the same values the production Snowflake pipeline
+(`defi-hyperliquid-halo`) ships: same eligibility gate, ids, symbology
+(HIP-3 markets as `TSLA-XYZ/USDC`), `PositionEffect`, `Blockchain` and
+per-market `SymbolType`. By default `halo.csv` keeps the raw `OrderID` (so executions join to
+the orders feed) and adds a trailing `IsMaker` column; `--halo-strict`
+switches both to production's form (`-B`/`-S` suffixed order ids, no
+`IsMaker`) for files that go to HALO. The parity table is in
+`docs/hl_execs_halo_mapping.md` §5.
+
 See the docs for the full field-by-field rationale and the pipeline
 architecture:
 
@@ -83,9 +97,26 @@ python -m hyperliquid_halo.cli export-execs \
 | `--token-a`      | `TOKEN_A_SYMBOL` filter — base token (useful for spot).                        |
 | `--token-b`      | `TOKEN_B_SYMBOL` filter — quote token (useful for spot).                       |
 | `--out-dir`      | Directory for `halo.csv` + `aux.csv` (default `./output`).                       |
+| `--include-ineligible` | Skip the production eligibility gate: also export liquidations, auto-deleveraging, vault aggregation rows, dust sweeps and trades with unresolved symbols. Research use; such a file is not what production ships to HALO. |
+| `--halo-strict`  | Emit exactly what production ships: `OrderID`/`MatchingOrderID` carry the `-B`/`-S` side suffix, no `IsMaker` column, a failing DQ check removes the files and exits 1, and the output is packaged as per-date part files (below). Cannot be combined with `--include-ineligible`. |
+| `--max-file-mb`  | Package the HALO output as per-transact-date part files capped at this size, named like production's `{prefix}_LINKED_PRIVATE_EXECUTION_V2_DDMMYYYY_partN.csv`, with the matching aux parts under `aux/`. Defaults to 250 (production's cap, well under HALO's 500 MB limit) with `--halo-strict`, otherwise single `halo.csv` + `aux.csv`. |
+| `--file-prefix`  | Prefix for packaged part names (default `sdny`, production's tenant prefix). |
 
-Filters are ANDed. Passing *nothing* but a date range returns every trade
-in the range.
+A typical upload-ready run, one day at a time so a DQ failure on one day
+never discards the others:
+
+```bash
+python -m hyperliquid_halo.cli export-execs \
+    --start 2026-01-12 --end 2026-01-13 --halo-strict \
+    --out-dir ./output/halo_strict_202601
+# -> output/halo_strict_202601/sdny_LINKED_PRIVATE_EXECUTION_V2_12012026_part1.csv, _part2.csv, ...
+#    output/halo_strict_202601/aux/<same names>   (not for upload)
+```
+
+Filters are ANDed. Passing *nothing* but a date range returns every
+eligible trade in the range. By default the export applies production's
+eligibility gate (see `docs/hl_execs_halo_mapping.md` §2.5), which drops
+forced closures and unresolved symbols whole-trade.
 
 ### Orders (from `RAW.ORDERS`)
 
@@ -124,12 +155,29 @@ python -m hyperliquid_halo.cli export-orders \
 | `--market-type`  | `spot` (matches `@N`-prefixed and `base/quote` COINs) or `perpetuals` (everything else). Inferred from `COIN` shape — `RAW.ORDERS` has no native market-type column. |
 | `--user`         | Filter by the on-chain `USER` address (useful for per-account analysis).                      |
 | `--out-dir`      | Directory for `halo_orders.csv` + `aux_orders.csv` (default `./output`).                        |
+| `--spot-lookback-days` | Days before `--start` to scan `DEX.TRADES` when resolving `@N` spot pair ids to token symbols (`@107` → `HYPE/USDC`). Default 30. Pairs with no trade in the window keep an `@N/USDC` placeholder and are listed in a warning. |
 
 `filled` order rows are filtered at source — fills are covered by the
 trades pipeline and HALO order `Status` does not accept `Filled`. `Vault
 Close` orders are also filtered (out of scope today). See §8 of
 [`docs/hl_orders_halo_mapping.md`](docs/hl_orders_halo_mapping.md) for
 the full list of decisions and deferred work.
+
+## Keeping the SymbolType map in sync
+
+Both feeds emit HALO `SymbolType` from `src/hyperliquid_halo/symbol_type_map.py`,
+a generated mirror of production's per-market map
+(`db/migrations/hyperliquid/R__06b_symbol_type_map.sql` in
+`defi-hyperliquid-halo`). When production regenerates that map (new
+listings), re-sync the mirror and commit it:
+
+```bash
+python -m hyperliquid_halo.sync_symbol_type_map \
+    --source ../defi-hyperliquid-halo/db/migrations/hyperliquid/R__06b_symbol_type_map.sql
+```
+
+Perp markets missing from the map ship with an empty `SymbolType` (no
+guessed fallback), the same as production.
 
 ## Validating output
 
@@ -162,6 +210,9 @@ Pre-wired debug launch configurations live in `.vscode/launch.json`:
 - **List markets** — print the trade market summary for a range.
 - **Export orders: BTC perps (yesterday)** — one-day BTC perp order export.
 - **List order coins** — print the order activity summary by COIN.
+- **Export: all markets incl. ineligible (one day)**: research export with the eligibility gate off.
+- **Export: BTC perps (HALO strict, one day)**: production-shaped `halo.csv` (`--halo-strict`).
+- **Sync SymbolType map from production**: regenerate `symbol_type_map.py`; assumes the production repo is at `~/Desktop/defi-hyperliquid-halo` (path is workspace-relative, edit if needed).
 
 ## Project layout
 
@@ -172,6 +223,9 @@ src/hyperliquid_halo/
     exporter.py           # Executions: streams query results -> halo.csv + aux.csv
     orders_mapping.py     # Orders: SQL template + OrdersQueryParams
     orders_exporter.py    # Orders: streams query results -> halo_orders.csv + aux_orders.csv
+    symbol_type_map.py    # GENERATED per-market HALO SymbolType (mirror of production R__06b)
+    sync_symbol_type_map.py  # regenerates symbol_type_map.py from the production SQL
+    dq.py                 # Executions: streaming mirror of production's DQ-1..DQ-9
     snowflake_client.py   # env-driven Snowflake connection helper
     cli.py                # click-based entrypoint (4 subcommands)
 tests/
@@ -179,8 +233,14 @@ tests/
     test_exporter.py
     test_orders_mapping.py
     test_orders_exporter.py
+    test_symbol_type_map.py
+    test_dq.py
 docs/
     FUNCTIONAL_SPEC.md             # repo-flavored architecture + algorithms (both feeds)
     hl_execs_halo_mapping.md       # portable trades -> HALO Execution mapping (field by field)
     hl_orders_halo_mapping.md      # portable orders -> HALO Order mapping (field by field, + §8 decisions)
 ```
+
+## See also: the hyperliquid-investigator skill
+
+The analyst-facing Hyperliquid knowledge (venue data model, Solidus table map, read-only query recipes, PnL rules, the public API client, case patterns) lives in the Claude Code skill at `~/.claude/skills/hyperliquid-investigator/`. The two mapping docs under `docs/` stay the canonical semantic references for the Allium to HALO V2.1 mapping (row expansion per side, PositionEffect, the 23-status collapse, ALO to PostOnly, brackets); the skill cites them and does not copy them.

@@ -14,6 +14,7 @@ from hyperliquid_halo.orders_mapping import (
     ALL_ORDER_COLUMNS,
     AUX_ORDER_COLUMNS,
     HALO_ORDER_COLUMNS,
+    HIP3_DEX_QUOTE_TOKEN,
     OrdersQueryParams,
     build_orders_query,
 )
@@ -44,7 +45,7 @@ def test_build_query_excludes_filled_and_vault_close(base_params: OrdersQueryPar
 
 def test_build_query_omits_optional_filters_when_none(base_params: OrdersQueryParams) -> None:
     sql, binds = build_orders_query(base_params)
-    assert "AND COIN" not in sql
+    assert "AND COIN = %(coin)s" not in sql  # the spot_pairs CTE has its own COIN predicate
     assert "USER" not in binds  # user is the bind name; "USER" column always appears
     assert "coin" not in binds
     assert "market_type" not in binds
@@ -133,6 +134,78 @@ def test_halo_order_columns_match_v21_required_set() -> None:
     }
     missing = required - set(HALO_ORDER_COLUMNS)
     assert not missing, f"HALO_ORDER_COLUMNS missing required fields: {missing}"
+
+
+def test_symbol_uses_dex_suffixed_hip3_form_and_per_dex_quote() -> None:
+    """xyz:TSLA -> TSLA-XYZ/USDC, hyna:X -> X-HYNA/USDE; same symbology as executions."""
+    sql, _ = build_orders_query(
+        OrdersQueryParams(
+            start_ts=datetime(2026, 4, 1, tzinfo=UTC),
+            end_ts=datetime(2026, 4, 2, tzinfo=UTC),
+        )
+    )
+    assert "WHEN COIN LIKE '%%:%%'" in sql
+    assert "SPLIT_PART(COIN, ':', 2) || '-' || UPPER(SPLIT_PART(COIN, ':', 1)) || '/'" in sql
+    assert "WHEN 'hyna' THEN 'USDE'" in sql
+    assert "WHEN 'xyz' THEN 'USDC'" in sql
+    assert "ELSE 'USDC'" in sql
+    # Legacy base/quote spot passes through; plain perps and @N get /USDC.
+    assert "WHEN COIN LIKE '%%/%%' THEN COIN" in sql
+    assert "ELSE COIN || '/USDC'" in sql
+    for dex, quote in HIP3_DEX_QUOTE_TOKEN.items():
+        assert dex == dex.lower()
+        assert quote.isupper()
+
+
+def test_blockchain_and_symbol_type_match_executions_feed() -> None:
+    sql, _ = build_orders_query(
+        OrdersQueryParams(
+            start_ts=datetime(2026, 4, 1, tzinfo=UTC),
+            end_ts=datetime(2026, 4, 2, tzinfo=UTC),
+        )
+    )
+    assert "'ethereum'                                                         AS Blockchain" in sql
+    assert "'hyperliquid'" not in sql
+    assert "symbol_type_map AS (" in sql
+    assert "('BTC', 'Crypto')" in sql
+    assert "LEFT JOIN symbol_type_map m ON m.map_coin = filtered.COIN" in sql
+    assert "THEN 'Crypto' ELSE m.symbol_type END" in sql
+    symbol_type_pos = HALO_ORDER_COLUMNS.index("SymbolType")
+    assert symbol_type_pos == HALO_ORDER_COLUMNS.index("ContractMultiplier") + 1
+
+
+def test_spot_pairs_resolved_from_dex_trades_with_lookback() -> None:
+    """@N -> TOKEN_A/TOKEN_B via a DEX.TRADES lookback join; placeholder otherwise."""
+    params = OrdersQueryParams(
+        start_ts=datetime(2026, 9, 20, tzinfo=UTC),
+        end_ts=datetime(2026, 9, 21, tzinfo=UTC),
+        spot_lookback_days=7,
+    )
+    sql, binds = build_orders_query(params)
+    assert binds["spot_lookup_start"] == datetime(2026, 9, 13, tzinfo=UTC)
+    assert "spot_pairs AS (" in sql
+    assert "FROM ALLIUM_HYPERLIQUID.DEX.TRADES" in sql
+    assert "AND TIMESTAMP >= %(spot_lookup_start)s" in sql
+    resolved = "COALESCE(sp.token_a || '/' || sp.token_b, COIN || '/USDC')"
+    assert f"WHEN COIN LIKE '@%%' THEN {resolved}" in sql
+    assert "'Hyperliquid:' || COALESCE(sp.pair, COIN)" in sql
+    assert "LEFT JOIN spot_pairs sp ON sp.spot_coin = filtered.COIN" in sql
+    # The @ branch must come before the HIP-3 ':' branch and the plain fallback.
+    assert sql.index("WHEN COIN LIKE '@%%'") < sql.index("WHEN COIN LIKE '%%:%%'")
+
+
+def test_spot_lookback_default_and_validation() -> None:
+    params = OrdersQueryParams(
+        start_ts=datetime(2026, 9, 20, tzinfo=UTC),
+        end_ts=datetime(2026, 9, 21, tzinfo=UTC),
+    )
+    assert params.spot_lookback_days == 30
+    with pytest.raises(ValueError, match="spot_lookback_days"):
+        OrdersQueryParams(
+            start_ts=datetime(2026, 9, 20, tzinfo=UTC),
+            end_ts=datetime(2026, 9, 21, tzinfo=UTC),
+            spot_lookback_days=-1,
+        )
 
 
 def test_status_mapping_collapses_rejects_and_cancels() -> None:

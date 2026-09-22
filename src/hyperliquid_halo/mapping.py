@@ -8,15 +8,32 @@ source lacks data) plus leading-underscore ``_*`` columns that preserve
 Hyperliquid-specific context for downstream surveillance. The exporter splits
 those two groups into two CSV files (halo.csv + aux.csv) joined on ``Id``.
 
+The mapping mirrors the production Snowflake view
+``hyperliquid_v_linked_private_execution_v2`` (repo ``defi-hyperliquid-halo``,
+``R__07_source_views.sql``) so that a CSV exported here carries the same
+values production ships to HALO. Where this exporter deliberately differs,
+``docs/hl_execs_halo_mapping.md`` section 5 records it.
+
 Market handling:
-    * ``SecurityType`` is ``SWAP`` for perpetuals and ``SPOT`` for spot —
+    * ``SecurityType`` is ``SWAP`` for perpetuals and ``SPOT`` for spot;
       this is the authoritative perp-vs-spot distinction.
-    * ``Symbol`` is ``<TOKEN_A_SYMBOL>/<TOKEN_B_SYMBOL>`` for both market
-      types (e.g. ``BTC/USDC`` for BTC perps, ``UBTC/USDC`` for Unit BTC
-      spot). Falls back to ``COIN`` when token symbols are missing.
+    * ``Symbol`` is ``<TOKEN_A_SYMBOL>/<TOKEN_B_SYMBOL>`` for main-dex perps
+      and spot (``BTC/USDC``, ``HYPE/USDC``) and
+      ``<TOKEN_A_SYMBOL>-<DEX>/<TOKEN_B_SYMBOL>`` for HIP-3 perps
+      (``TSLA-XYZ/USDC``) so the same underlying on two builder dexes never
+      collides.
     * ``PositionEffect`` and ``ContractMultiplier`` are emitted only for
       perpetuals; they are NULL for spot (PositionEffect is not applicable and
       HALO's ContractMultiplier requirement is SWAP/FUT/OPT/CFD-only).
+    * ``SymbolType`` is ``Crypto`` for spot and the seeded per-market value
+      (:mod:`hyperliquid_halo.symbol_type_map`) for perps; a perp missing
+      from the map emits NULL rather than a guess.
+
+Eligibility:
+    By default the query applies production's eligibility gate (unresolved
+    symbols, forced closures, vault aggregation rows and dust sweeps are
+    dropped whole-trade). ``QueryParams.include_ineligible`` disables the
+    gate for research exports; see ``_ELIGIBILITY_SQL``.
 
 See ``docs/FUNCTIONAL_SPEC.md`` for the full field-by-field rationale.
 """
@@ -26,6 +43,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from typing import Any
+
+from .symbol_type_map import render_values_rows
 
 HALO_COLUMNS: tuple[str, ...] = (
     "TransactTime",
@@ -57,11 +76,15 @@ HALO_COLUMNS: tuple[str, ...] = (
     "ExchangeSymbol",
     "PositionEffect",
     "ContractMultiplier",
+    "SymbolType",
     "IsMaker",
 )
 """HALO v2.1 columns emitted in the halo.csv file, in output order.
 
-Note: ``IsMaker`` is not part of the HALO v2.1 spec — it's a Hyperliquid-
+The order matches production's ``hyperliquid_v_linked_private_execution_v2``
+column order (``TransactTime`` .. ``SymbolType``).
+
+Note: ``IsMaker`` is not part of the HALO v2.1 spec; it's a Hyperliquid-
 specific flag added at the user's request. HALO ignores unknown columns on
 upload so including it here does not break ingestion.
 """
@@ -81,6 +104,7 @@ AUX_COLUMNS: tuple[str, ...] = (
     "_LiquidationMethod",
     "_TransactionHash",
     "_SourceTradeId",
+    "_TradeId",
     "_MarketType",
     "_Coin",
     "_TokenA",
@@ -97,6 +121,14 @@ ALL_COLUMNS: tuple[str, ...] = HALO_COLUMNS + AUX_COLUMNS[1:]
 """Full column list returned by the SQL (HALO cols + aux cols, deduped on Id)."""
 
 
+HALO_STRICT_COLUMNS: tuple[str, ...] = tuple(c for c in HALO_COLUMNS if c != "IsMaker")
+"""``halo.csv`` columns in HALO-strict mode (``QueryParams.halo_strict``):
+production's ``hyperliquid_v_linked_private_execution_v2`` column set and
+order exactly, i.e. :data:`HALO_COLUMNS` without the non-HALO ``IsMaker``
+column. The maker flag is still available in aux as ``_IsTaker``.
+"""
+
+
 @dataclass(frozen=True)
 class QueryParams:
     """Bind parameters for the mapping query.
@@ -106,13 +138,25 @@ class QueryParams:
             treated as UTC.
         end_ts: Exclusive upper bound on ``TIMESTAMP``.
         coin: Optional Allium ``COIN`` filter. For perpetuals this is the token
-            symbol (``BTC``, ``ETH``); for spot it is a pair id (``@4``). When
-            ``None``, no coin filter is applied.
+            symbol (``BTC``, ``ETH``) or the dex-prefixed HIP-3 name
+            (``xyz:TSLA``); for spot it is a pair id (``@4``). When ``None``,
+            no coin filter is applied.
         market_type: Optional ``'spot'`` or ``'perpetuals'`` filter. When
             ``None``, both market types are returned.
         token_a: Optional ``TOKEN_A_SYMBOL`` filter (useful for spot where the
             user thinks in token symbols rather than pair ids).
         token_b: Optional ``TOKEN_B_SYMBOL`` filter.
+        include_ineligible: When ``True``, skip production's eligibility
+            gate and return every trade in range, including liquidations,
+            auto-deleveraging, vault aggregation rows, dust sweeps and
+            trades with unresolved symbols. Default ``False`` matches what
+            production ships to HALO.
+        halo_strict: When ``True``, produce exactly what production ships:
+            ``OrderID`` / ``MatchingOrderID`` carry the ``-B`` / ``-S`` side
+            suffix and ``halo.csv`` drops the non-HALO ``IsMaker`` column
+            (:data:`HALO_STRICT_COLUMNS`). Cannot be combined with
+            ``include_ineligible``. Default ``False`` keeps raw order ids so
+            executions join to this project's orders feed.
     """
 
     start_ts: datetime
@@ -121,6 +165,8 @@ class QueryParams:
     market_type: str | None = None
     token_a: str | None = None
     token_b: str | None = None
+    include_ineligible: bool = False
+    halo_strict: bool = False
 
     def __post_init__(self) -> None:
         if self.market_type is not None and self.market_type not in ("spot", "perpetuals"):
@@ -130,6 +176,11 @@ class QueryParams:
         if self.end_ts <= self.start_ts:
             raise ValueError(
                 f"end_ts ({self.end_ts}) must be strictly greater than start_ts ({self.start_ts})"
+            )
+        if self.halo_strict and self.include_ineligible:
+            raise ValueError(
+                "halo_strict and include_ineligible are mutually exclusive: a strict file "
+                "must contain only what production ships to HALO"
             )
 
 
@@ -144,7 +195,8 @@ def build_query(params: QueryParams) -> tuple[str, dict[str, Any]]:
     """Render the mapping SQL and build its bind-parameter dict.
 
     Args:
-        params: Query parameters (date range and optional market filters).
+        params: Query parameters (date range, optional market filters, and
+            the eligibility switch).
 
     Returns:
         A ``(sql, binds)`` pair suitable for
@@ -182,12 +234,40 @@ def build_query(params: QueryParams) -> tuple[str, dict[str, Any]]:
         filters.append("AND TOKEN_B_SYMBOL = %(token_b)s")
         binds["token_b"] = params.token_b
 
-    extra_filters = "\n          ".join(filters)
-    sql = _SQL_TEMPLATE.format(extra_filters=extra_filters)
+    extra_filters = "\n      ".join(filters)
+    eligibility = "" if params.include_ineligible else _ELIGIBILITY_SQL
+    sql = _render_sql_template(strict=params.halo_strict).format(
+        symbol_type_values=render_values_rows(),
+        eligibility=eligibility,
+        extra_filters=extra_filters,
+    )
     return sql, binds
 
 
-# The two CTEs are nearly identical — we build them from a shared template so
+# Production's eligibility gate (hyperliquid_v_source_eligible, R__07), verbatim
+# apart from the doubled '%%' that the Snowflake connector's pyformat
+# preprocessor collapses back to '%'. A trade is dropped whole (both sides,
+# preserving Buy/Sell parity) when:
+#   1. its symbol is unresolved: TOKEN_A/TOKEN_B is NULL (Allium has not
+#      mapped a new spot pair yet) or a HIP-3 row has no PERP_DEX;
+#   2. either side is a forced closure: the liquidation family ('%Liquidat%'
+#      catches 'Liquidated Cross/Isolated Long/Short' plus 'Partial Borrow
+#      Liquidation' / 'Backstop Borrow Liquidation') or 'Auto-Deleveraging';
+#   3. either side is not a real execution: 'Net Child Vaults' (vault
+#      aggregation) or 'Spot Dust Conversion' (exchange dust sweep).
+# IS_HIP3 is NULL on spot rows, so it must be COALESCEd: the un-coalesced form
+# silently dropped every spot trade in production until 2026-08-24. NULL
+# directions (Allium history through 2025-05-23) make the NOT(...) predicates
+# evaluate NULL and are dropped too; that is intentional.
+_ELIGIBILITY_SQL = """AND TOKEN_A_SYMBOL IS NOT NULL
+      AND TOKEN_B_SYMBOL IS NOT NULL
+      AND NOT (COALESCE(IS_HIP3, FALSE) AND PERP_DEX IS NULL)
+      AND NOT (BUYER_DIR ILIKE '%%Liquidat%%' OR SELLER_DIR ILIKE '%%Liquidat%%')
+      AND NOT (BUYER_DIR IN ('Auto-Deleveraging', 'Net Child Vaults', 'Spot Dust Conversion')
+            OR SELLER_DIR IN ('Auto-Deleveraging', 'Net Child Vaults', 'Spot Dust Conversion'))"""
+
+
+# The two CTEs are nearly identical; we build them from a shared template so
 # the buy/sell mapping cannot drift out of sync.
 def _side_cte(
     name: str,
@@ -197,34 +277,43 @@ def _side_cte(
     other_prefix: str,
     id_suffix: str,
     match_suffix: str,
+    strict: bool,
 ) -> str:
     """Render one side of the mapping CTE.
 
     Args:
         name: CTE name (``buy_side`` / ``sell_side``).
-        side_label: ``'Buy'`` or ``'Sell'`` — the HALO ``Side`` enum value.
+        side_label: ``'Buy'`` or ``'Sell'``, the HALO ``Side`` enum value.
         self_prefix: Column prefix for the side being emitted (``BUYER`` / ``SELLER``).
         other_prefix: Column prefix for the counterparty (``SELLER`` / ``BUYER``).
-        id_suffix: Suffix appended to ``TRADE_ID`` for the HALO ``Id`` (``-B`` / ``-S``).
+        id_suffix: Suffix appended to the exec key for the HALO ``Id`` (``-B`` / ``-S``).
         match_suffix: Suffix for the counterparty ``MatchingID`` (``-S`` / ``-B``).
+        strict: HALO-strict mode. When ``True`` the order ids carry the same
+            side suffixes as ``Id`` / ``MatchingID`` (production form); when
+            ``False`` they are the raw Hyperliquid order ids.
 
     Returns:
         A SQL fragment defining the named CTE.
     """
+    if strict:
+        order_id_lines = f"""        -- HALO-strict: production's side-suffixed order ids.
+        {self_prefix}_ORDER_ID::STRING || '{id_suffix}'                  AS OrderID,
+        {other_prefix}_ORDER_ID::STRING || '{match_suffix}'              AS MatchingOrderID,"""
+    else:
+        order_id_lines = f"""\
+        -- Raw Hyperliquid order ids (no side suffix) so executions stay
+        -- joinable to this project's orders feed (halo_orders.csv Id).
+        -- Production appends '-B'/'-S'; --halo-strict does the same.
+        {self_prefix}_ORDER_ID::STRING                                 AS OrderID,
+        {other_prefix}_ORDER_ID::STRING                                AS MatchingOrderID,"""
     return f"""{name} AS (
     SELECT
-        DATE_PART(EPOCH_MILLISECOND, TIMESTAMP)::BIGINT                AS TransactTime,
-        -- UNIQUE_ID (TRADE_ID-COIN-TIMESTAMP) is globally unique; TRADE_ID alone is
-        -- only unique per coin, so an all-market export would hand HALO colliding
-        -- Ids. The space in UNIQUE_ID's timestamp is replaced with 'T' so the id
-        -- carries no whitespace (same scheme as the production pipeline).
-        REPLACE(UNIQUE_ID, ' ', 'T') || '{id_suffix}'                  AS Id,
-        REPLACE(UNIQUE_ID, ' ', 'T') || '{match_suffix}'               AS MatchingID,
-        {self_prefix}_ORDER_ID::STRING                                 AS OrderID,
-        {other_prefix}_ORDER_ID::STRING                                AS MatchingOrderID,
+        transact_time_ms                                               AS TransactTime,
+        exec_key || '{id_suffix}'                                      AS Id,
+        exec_key || '{match_suffix}'                                   AS MatchingID,
+{order_id_lines}
         'EXCHANGE'                                                     AS ExecutionType,
-        COALESCE(TOKEN_A_SYMBOL, COIN) || '/' || COALESCE(TOKEN_B_SYMBOL, 'USDC')
-                                                                       AS Symbol,
+        symbol_str                                                     AS Symbol,
         '{side_label}'                                                 AS Side,
         AMOUNT::STRING                                                 AS Quantity,
         PRICE::STRING                                                  AS Price,
@@ -240,16 +329,13 @@ def _side_cte(
         'Agency'                                                       AS OrderCapacity,
         'Agency'                                                       AS MatchingOrderCapacity,
         'RegularTrade'                                                 AS TrdType,
-        CASE
-            WHEN {self_prefix}_TWAP_ID IS NOT NULL AND {self_prefix}_TWAP_ID != ''
-            THEN {self_prefix}_TWAP_ID::STRING
-        END                                                            AS ParentOrderId,
+        NULLIF({self_prefix}_TWAP_ID::STRING, '')                      AS ParentOrderId,
         -- HALO's Blockchain enum has no 'Hyperliquid' value; 'ethereum' is the
         -- closest valid one (HL accounts are EVM addresses).
         'ethereum'                                                     AS Blockchain,
         {self_prefix}_ADDRESS                                          AS WalletAddress,
-        CASE WHEN MARKET_TYPE = 'perpetuals' THEN 'SWAP' ELSE 'SPOT' END AS SecurityType,
-        'Hyperliquid:' || COALESCE(NULLIF(PAIR, ''), COIN)             AS ExchangeSymbol,
+        security_type_str                                              AS SecurityType,
+        exchange_symbol_str                                            AS ExchangeSymbol,
         -- 'Settlement' is an exchange settlement of the position (delisting) -> CLOSE.
         -- Every other direction (flips, liquidations, ADL, dust conversions, vault
         -- aggregation) has no clean open/close semantics and stays NULL -- the empty
@@ -257,10 +343,12 @@ def _side_cte(
         CASE
             WHEN MARKET_TYPE = 'perpetuals' AND {self_prefix}_DIR IN ('Open Long', 'Open Short')
                 THEN 'OPEN'
-            WHEN MARKET_TYPE = 'perpetuals' AND {self_prefix}_DIR IN ('Close Long', 'Close Short', 'Settlement')
+            WHEN MARKET_TYPE = 'perpetuals'
+                AND {self_prefix}_DIR IN ('Close Long', 'Close Short', 'Settlement')
                 THEN 'CLOSE'
         END                                                            AS PositionEffect,
-        CASE WHEN MARKET_TYPE = 'perpetuals' THEN '1' END               AS ContractMultiplier,
+        contract_multiplier_str                                        AS ContractMultiplier,
+        symbol_type_str                                                AS SymbolType,
 
         -- Supplementary (aux) fields --------------------------------------
         NOT {self_prefix}_CROSSED                                      AS IsMaker,
@@ -275,7 +363,8 @@ def _side_cte(
         LIQUIDATION_MARK_PRICE                                         AS _LiquidationMarkPrice,
         LIQUIDATION_METHOD                                             AS _LiquidationMethod,
         TRANSACTION_HASH                                               AS _TransactionHash,
-        TRADE_ID                                                       AS _SourceTradeId,
+        exec_key                                                       AS _SourceTradeId,
+        TRADE_ID                                                       AS _TradeId,
         MARKET_TYPE                                                    AS _MarketType,
         COIN                                                           AS _Coin,
         TOKEN_A_SYMBOL                                                 AS _TokenA,
@@ -284,38 +373,89 @@ def _side_cte(
         PERP_DEX                                                       AS _PerpDex,
         PERP_MARKET_NAME                                               AS _PerpMarketName,
         IS_HIP3                                                        AS _IsHip3
-    FROM filtered
+    FROM base
 )"""
 
 
-_BUY_CTE = _side_cte(
-    "buy_side",
-    side_label="Buy",
-    self_prefix="BUYER",
-    other_prefix="SELLER",
-    id_suffix="-B",
-    match_suffix="-S",
-)
+def _render_sql_template(*, strict: bool) -> str:
+    """Assemble the full mapping SQL for one mode.
 
-_SELL_CTE = _side_cte(
-    "sell_side",
-    side_label="Sell",
-    self_prefix="SELLER",
-    other_prefix="BUYER",
-    id_suffix="-S",
-    match_suffix="-B",
-)
+    The result still carries the ``{symbol_type_values}``, ``{eligibility}``
+    and ``{extra_filters}`` placeholders that :func:`build_query` fills in.
+    ``base`` derives the per-trade values once (same shape as production's
+    ``base`` CTE) so both side projections read identical Symbol /
+    SecurityType / ExchangeSymbol / SymbolType values by construction.
 
+    Args:
+        strict: HALO-strict mode; see :func:`_side_cte`.
 
-_SQL_TEMPLATE = f"""WITH filtered AS (
+    Returns:
+        The SQL template text.
+    """
+    buy_cte = _side_cte(
+        "buy_side",
+        side_label="Buy",
+        self_prefix="BUYER",
+        other_prefix="SELLER",
+        id_suffix="-B",
+        match_suffix="-S",
+        strict=strict,
+    )
+    sell_cte = _side_cte(
+        "sell_side",
+        side_label="Sell",
+        self_prefix="SELLER",
+        other_prefix="BUYER",
+        id_suffix="-S",
+        match_suffix="-B",
+        strict=strict,
+    )
+    return f"""WITH symbol_type_map AS (
+    SELECT map_coin, symbol_type FROM VALUES
+        {{symbol_type_values}}
+    AS t(map_coin, symbol_type)
+),
+eligible AS (
     SELECT *
     FROM ALLIUM_HYPERLIQUID.DEX.TRADES
     WHERE TIMESTAMP >= %(start_ts)s
       AND TIMESTAMP <  %(end_ts)s
+      {{eligibility}}
       {{extra_filters}}
 ),
-{_BUY_CTE},
-{_SELL_CTE}
+base AS (
+    SELECT
+        e.*,
+        DATE_PART(EPOCH_MILLISECOND, e.TIMESTAMP)::BIGINT AS transact_time_ms,
+        -- Per-execution identity sent to HALO as Id/MatchingID (with a '-B'/'-S'
+        -- side suffix). UNIQUE_ID (TRADE_ID-COIN-TIMESTAMP) is globally unique;
+        -- TRADE_ID alone is only unique per coin and collides across markets.
+        -- The single space is replaced with 'T' so the id carries no whitespace;
+        -- this stays a 1:1 mapping back to the source UNIQUE_ID.
+        REPLACE(e.UNIQUE_ID, ' ', 'T') AS exec_key,
+        -- HIP-3 markets embed the dex so the same underlying on two builder
+        -- dexes (xyz:TSLA vs cash:TSLA) never collides in HALO.
+        CASE
+            WHEN COALESCE(e.IS_HIP3, FALSE)
+                THEN e.TOKEN_A_SYMBOL || '-' || UPPER(e.PERP_DEX) || '/' || e.TOKEN_B_SYMBOL
+            ELSE e.TOKEN_A_SYMBOL || '/' || e.TOKEN_B_SYMBOL
+        END AS symbol_str,
+        CASE WHEN e.MARKET_TYPE = 'perpetuals' THEN 'SWAP' ELSE 'SPOT' END AS security_type_str,
+        'Hyperliquid:' || COALESCE(NULLIF(e.PAIR, ''), e.COIN) AS exchange_symbol_str,
+        CASE WHEN e.MARKET_TYPE = 'perpetuals' THEN '1' END AS contract_multiplier_str,
+        -- SymbolType: spot is crypto-only on Hyperliquid, so spot rows are always
+        -- 'Crypto'. Perps take the seeded per-market value and nothing else: a
+        -- perp missing from the map ships with SymbolType empty (optional in
+        -- HALO) until the map is regenerated. No guessed fallback.
+        CASE
+            WHEN e.MARKET_TYPE = 'spot' THEN 'Crypto'
+            ELSE m.symbol_type
+        END AS symbol_type_str
+    FROM eligible e
+    LEFT JOIN symbol_type_map m ON m.map_coin = e.COIN
+),
+{buy_cte},
+{sell_cte}
 SELECT * FROM buy_side
 UNION ALL
 SELECT * FROM sell_side

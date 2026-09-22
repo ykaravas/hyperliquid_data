@@ -36,11 +36,17 @@ class OrdersExportResult:
         aux_path: Path to the aux order CSV on disk.
         row_count: Total rows written (equal in both files). One row per
             source ``RAW.ORDERS`` status-change event after filters.
+        unresolved_spot_coins: ``@N`` spot pairs that no ``DEX.TRADES`` row in
+            the lookback window could name; their ``Symbol`` is the
+            ``@N/USDC`` placeholder. Empty when every spot pair resolved.
+        unresolved_spot_rows: Number of rows carrying such a placeholder.
     """
 
     halo_path: Path
     aux_path: Path
     row_count: int
+    unresolved_spot_coins: tuple[str, ...] = ()
+    unresolved_spot_rows: int = 0
 
 
 def _row_to_dict(columns: Sequence[str], row: Sequence[Any]) -> dict[str, Any]:
@@ -91,6 +97,8 @@ def export_orders_to_csv(
     logger.info("Executing orders mapping query with binds=%s", binds)
 
     row_count = 0
+    unresolved_rows = 0
+    unresolved_coins: set[str] = set()
     with cursor() as cur:
         cur.execute(sql, binds)
         # Snowflake uppercases unquoted aliases; build an upper() -> cursor-name
@@ -127,9 +135,28 @@ def export_orders_to_csv(
                     halo_writer.writerow(halo_row)
                     aux_writer.writerow(aux_row)
                     row_count += 1
+                    # A Symbol still starting with '@' is an unresolved spot pair
+                    # (the lookback join found no trade naming its tokens).
+                    symbol = halo_row.get("Symbol")
+                    if isinstance(symbol, str) and symbol.startswith("@"):
+                        unresolved_rows += 1
+                        unresolved_coins.add(str(aux_row.get("_Coin")))
 
+    if unresolved_rows:
+        logger.warning(
+            "%d order rows on %d spot pair(s) kept the @N/USDC placeholder Symbol "
+            "(no DEX.TRADES row in the %d-day lookback named them): %s",
+            unresolved_rows, len(unresolved_coins), params.spot_lookback_days,
+            ", ".join(sorted(unresolved_coins)),
+        )
     logger.info("Wrote %d order rows to %s and %s", row_count, halo_path, aux_path)
-    return OrdersExportResult(halo_path=halo_path, aux_path=aux_path, row_count=row_count)
+    return OrdersExportResult(
+        halo_path=halo_path,
+        aux_path=aux_path,
+        row_count=row_count,
+        unresolved_spot_coins=tuple(sorted(unresolved_coins)),
+        unresolved_spot_rows=unresolved_rows,
+    )
 
 
 def list_order_coins(params: OrdersQueryParams) -> list[dict[str, Any]]:

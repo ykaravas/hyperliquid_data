@@ -132,6 +132,28 @@ def fake_rows() -> list[tuple[Any, ...]]:
     ]
 
 
+def test_export_orders_reports_unresolved_spot_placeholders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_rows: list[tuple[Any, ...]],
+) -> None:
+    """A Symbol still starting with '@' means the lookback found no naming trade."""
+    fake = _FakeCursor(columns=list(ALL_ORDER_COLUMNS), rows=fake_rows)
+
+    @contextmanager
+    def _fake_cursor() -> Iterator[_FakeCursor]:
+        yield fake
+
+    monkeypatch.setattr(orders_exporter, "cursor", _fake_cursor)
+    params = OrdersQueryParams(
+        start_ts=datetime(2026, 4, 1, tzinfo=UTC),
+        end_ts=datetime(2026, 4, 2, tzinfo=UTC),
+    )
+    result = orders_exporter.export_orders_to_csv(params, out_dir=tmp_path)
+    assert result.unresolved_spot_rows == 1
+    assert result.unresolved_spot_coins == ("@107",)
+
+
 def test_export_orders_writes_both_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -19,11 +19,16 @@
             "module": "hyperliquid_halo.cli",
             "args": [
                 "export-execs",
-                "--coin", "BTC",
-                "--market-type", "perpetuals",
-                "--start", "2026-04-13",
-                "--end", "2026-04-14",
-                "--out-dir", "${workspaceFolder}/output"
+                "--coin",
+                "BTC",
+                "--market-type",
+                "perpetuals",
+                "--start",
+                "2026-04-13",
+                "--end",
+                "2026-04-14",
+                "--out-dir",
+                "${workspaceFolder}/output"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
@@ -38,11 +43,16 @@
             "module": "hyperliquid_halo.cli",
             "args": [
                 "export-execs",
-                "--coin", "HYPE",
-                "--market-type", "spot",
-                "--start", "2026-04-01",
-                "--end", "2026-04-14",
-                "--out-dir", "${workspaceFolder}/output"
+                "--coin",
+                "HYPE",
+                "--market-type",
+                "spot",
+                "--start",
+                "2026-04-01",
+                "--end",
+                "2026-04-14",
+                "--out-dir",
+                "${workspaceFolder}/output"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
@@ -57,8 +67,10 @@
             "module": "hyperliquid_halo.cli",
             "args": [
                 "list-markets",
-                "--start", "2026-04-01",
-                "--end", "2026-04-14"
+                "--start",
+                "2026-04-01",
+                "--end",
+                "2026-04-14"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
@@ -73,11 +85,16 @@
             "module": "hyperliquid_halo.cli",
             "args": [
                 "export-orders",
-                "--coin", "BTC",
-                "--market-type", "perpetuals",
-                "--start", "2026-04-13",
-                "--end", "2026-04-14",
-                "--out-dir", "${workspaceFolder}/output"
+                "--coin",
+                "BTC",
+                "--market-type",
+                "perpetuals",
+                "--start",
+                "2026-04-13",
+                "--end",
+                "2026-04-14",
+                "--out-dir",
+                "${workspaceFolder}/output"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
@@ -92,8 +109,71 @@
             "module": "hyperliquid_halo.cli",
             "args": [
                 "list-order-coins",
-                "--start", "2026-04-01",
-                "--end", "2026-04-14"
+                "--start",
+                "2026-04-01",
+                "--end",
+                "2026-04-14"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Export: all markets incl. ineligible (one day)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export-execs",
+                "--start",
+                "2026-04-13",
+                "--end",
+                "2026-04-14",
+                "--include-ineligible",
+                "--out-dir",
+                "${workspaceFolder}/output/all_incl_ineligible"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Sync SymbolType map from production (defi-hyperliquid-halo)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.sync_symbol_type_map",
+            "args": [
+                "--source",
+                "${workspaceFolder}/../../../defi-hyperliquid-halo/db/migrations/hyperliquid/R__06b_symbol_type_map.sql"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Export: BTC perps (HALO strict, one day)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export-execs",
+                "--coin",
+                "BTC",
+                "--market-type",
+                "perpetuals",
+                "--start",
+                "2026-04-13",
+                "--end",
+                "2026-04-14",
+                "--halo-strict",
+                "--out-dir",
+                "${workspaceFolder}/output/btc_perps_halo_strict"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",

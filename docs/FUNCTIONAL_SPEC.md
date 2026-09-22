@@ -9,6 +9,12 @@ Solidus's HALO Trade Surveillance v2.1 ingestion format:
 | Executions  | `ALLIUM_HYPERLIQUID.DEX.TRADES`    | v2.1 **Execution Data** | `halo.csv` + `aux.csv`                |
 | Orders      | `ALLIUM_HYPERLIQUID.RAW.ORDERS`    | v2.1 **Order Data**     | `halo_orders.csv` + `aux_orders.csv`  |
 
+Both feeds mirror the production Snowflake pipeline in the
+`defi-hyperliquid-halo` repo (`hyperliquid_v_linked_private_execution_v2`
+for executions; production has no orders feed, so the orders feed follows
+the same symbology and enum choices). Parity status and the deliberate
+divergences are tabulated in `hl_execs_halo_mapping.md` §5.
+
 This file describes **how** the pipelines work — module layout, data
 flow, and the algorithmic decisions that aren't obvious from reading
 the code. **What** each HALO field is set to lives in the portable
@@ -26,8 +32,18 @@ src/hyperliquid_halo/
 ├── exporter.py              # executions: streams query → halo.csv + aux.csv
 ├── orders_mapping.py        # orders: SQL template + OrdersQueryParams + LIST_ORDER_COINS_SQL
 ├── orders_exporter.py       # orders: streams query → halo_orders.csv + aux_orders.csv
+├── symbol_type_map.py       # GENERATED: per-market HALO SymbolType, mirrored from production
+├── sync_symbol_type_map.py  # regenerates symbol_type_map.py from production's R__06b SQL
+├── dq.py                    # executions: streaming mirror of production's DQ-1..DQ-9
 └── cli.py                   # click CLI, 4 subcommands wiring the above
 ```
+
+`symbol_type_map.py` is data, not logic: a 500-row `(coin, symbol_type)`
+tuple plus a helper that renders it as SQL `VALUES` rows. Both SQL
+templates splice those rows into a `symbol_type_map` CTE and LEFT JOIN it
+on `COIN`, so the lookup happens in Snowflake alongside the rest of the
+mapping (no Python-side post-processing of HALO values, same principle as
+the removed PositionEffect defaulting in §3.1).
 
 The two feeds are kept in separate modules because their grain and
 filter sets differ enough that sharing the SQL builder would obscure
@@ -107,6 +123,32 @@ reassemble the trade. The shared CTE template guarantees the two sides
 cannot drift out of sync — there is exactly one definition of how a
 side row is built.
 
+### 3.0 Eligibility gate (production parity, default on)
+
+Before the row expansion, the `eligible` CTE applies production's
+`hyperliquid_v_source_eligible` predicates verbatim (`mapping._ELIGIBILITY_SQL`):
+unresolved symbols (`TOKEN_A_SYMBOL` / `TOKEN_B_SYMBOL` NULL, or HIP-3
+without `PERP_DEX`), forced closures (`ILIKE '%Liquidat%'`,
+`Auto-Deleveraging`) and non-executions (`Net Child Vaults`,
+`Spot Dust Conversion`) are dropped whole-trade. Two NULL hazards are
+handled the way production handles them: `IS_HIP3` is `COALESCE`d
+(NULL on spot rows) and NULL directions fall out of the `NOT (...)`
+predicates by design. `QueryParams.include_ineligible` (CLI
+`--include-ineligible`) removes the gate for research exports; the
+predicate block is simply omitted from the rendered SQL, everything
+else is unchanged. The `%` characters in the `ILIKE` patterns are doubled
+per §2.2. See `hl_execs_halo_mapping.md` §2.5, including the measured
+effect (about 1.5% of a day's trades, nearly all unresolved spot pairs)
+and the inherited gap: liquidation fills flagged only by
+`LIQUIDATED_USER` carry ordinary directions and pass the gate in
+production and here.
+
+A `base` CTE then derives the per-trade values once (`exec_key`,
+`symbol_str`, `security_type_str`, `exchange_symbol_str`,
+`contract_multiplier_str`, `symbol_type_str`) so both side projections
+read identical values by construction, the same shape as production's
+`base` CTE.
+
 ### 3.1 PositionEffect — no defaulting; empty means empty
 
 The SQL maps `Open Long`/`Open Short` to `OPEN` and `Close Long`/
@@ -130,14 +172,98 @@ dominant-leg labeling via `{side}_START_POSITION` is the documented
 option if surveillance ever needs flips categorized (see
 `hl_execs_halo_mapping.md` §2.1).
 
-### 3.2 IsMaker — non-HALO column on `halo.csv`
+### 3.2 IsMaker, a non-HALO column on `halo.csv` (default mode)
 
 `halo.csv` carries an `IsMaker` boolean computed as `NOT {side}_CROSSED`,
 referring to **`Account`** (not `MatchingAccount`). HALO ignores unknown
 columns on upload, so embedding this Hyperliquid-specific flag in the
 HALO file is safe. The complementary raw `_IsTaker` flag (= `{side}_CROSSED`)
 stays in the aux file for parity with upstream pipelines that consumed it
-that way.
+that way. Under `--halo-strict` (§3.4) the column is not written.
+
+### 3.5 Data-quality checks mirror production (`dq.py`)
+
+`ExecutionDqChecker` re-implements production's `hyperliquid_sp_run_dq`
+(`R__08`) as a single streaming pass: the exporter calls `observe()` per
+row while writing and `finish()` once at the end. DQ-3 to DQ-7 and the
+pattern half of DQ-8 are per-row counters; DQ-1, DQ-2, the symmetry
+half of DQ-8 and DQ-9 need per-trade state, and get it with O(1) memory
+because the query orders rows by `(TransactTime, _SourceTradeId, Side)`:
+a trade's two rows are adjacent, so the checker only ever holds the
+current trade group. Ids, predicates, observed payloads and severities
+match production (DQ-1..8 FAIL, DQ-9 WARN).
+
+Consequences per mode:
+
+- `--halo-strict`: a FAIL removes `halo.csv` and `aux.csv`, raises
+  `dq.DqFailure` (the CLI prints the report and exits 1). Nothing that
+  could be uploaded by mistake is left behind, production's "DQ fails,
+  nothing ships".
+- default: the report is logged and printed; nothing blocks. With
+  `--include-ineligible`, DQ-3 (empty `Symbol` on unresolved pairs) and
+  DQ-7 (liquidation directions) fail by construction.
+- DQ-9 (`SymbolType` empty on SWAP rows) warns in both modes and names
+  the top unmapped symbols, the cue to re-sync the map (§5.3).
+
+`ExportResult.dq_report` carries the full `DqReport` for programmatic
+callers.
+
+### 3.4 `--halo-strict`: production's file shape exactly
+
+`QueryParams.halo_strict` (CLI `--halo-strict`) switches two things and
+nothing else:
+
+- `_side_cte` renders `OrderID` / `MatchingOrderID` with the same `-B` /
+  `-S` side suffix as `Id` / `MatchingID`, production's form. The SQL is
+  rendered per call by `_render_sql_template(strict=...)`, so both modes
+  share one template and cannot drift.
+- The exporter writes `halo.csv` with `mapping.HALO_STRICT_COLUMNS`
+  (`HALO_COLUMNS` minus `IsMaker`), i.e. production's 30 columns in
+  production order. The SQL still computes `IsMaker`; only the CSV column
+  selection changes.
+
+`halo_strict` and `include_ineligible` are mutually exclusive
+(`QueryParams.__post_init__` raises; the CLI reports a usage error): a
+strict file must contain only what production ships. The default mode
+keeps raw order ids because the orders feed's `Id` is the raw `oid` and
+HALO links executions to orders through `OrderID`.
+
+Strict mode also packages the output the way production's `R__09` COPY
+does (§3.6).
+
+### 3.6 Packaging: per-date parts (`_OutputWriter`)
+
+Production COPYs each transact date separately into part files of at most
+250 MB named `sdny_LINKED_PRIVATE_EXECUTION_V2_DDMMYYYY_partN.csv` (well
+under HALO's 500 MB per-file limit). `exporter._OutputWriter` reproduces
+that: when `max_part_mb` is set (the default in strict mode is
+`DEFAULT_PART_MB = 250`; `--max-file-mb` overrides, `--file-prefix`
+changes the tenant prefix) it derives each row's transact date from
+`TransactTime`, opens `part1` for a new date, and rolls to the next part
+once the current HALO part reaches the cap. The size is checked every
+1,000 rows by flushing and reading the byte offset, so a part can overshoot
+the cap by at most that many rows (about 0.6 MB). Rows arrive ordered by
+`TransactTime`, so dates never interleave and part numbering restarts at 1
+per date. The aux rows are written to identically named files under
+`aux/`, keeping the output directory itself upload-ready. A DQ failure in
+strict mode removes every part written. `ExportResult.halo_paths` /
+`aux_paths` list the files in order; `halo_path` / `aux_path` are the first
+pair for callers that expect single files.
+
+### 3.3 Symbol and SymbolType
+
+`Symbol` is `TOKEN_A_SYMBOL/TOKEN_B_SYMBOL` for main-dex perps and spot,
+and `TOKEN_A_SYMBOL-<PERP_DEX upper>/TOKEN_B_SYMBOL` for HIP-3 rows
+(`TSLA-XYZ/USDC`, `1000PEPE-HYNA/USDE`), production's form; the dex is
+embedded because HIP-3 market names are not unique across builder dexes,
+and the quote token is the dex's collateral as Allium reports it. There
+is no fallback for a NULL token symbol: such rows are gated out (§3.0),
+or, with the gate off, ship with an empty `Symbol` and the raw ids in aux.
+
+`SymbolType` is `Crypto` for spot and the seeded per-market value for
+perps, NULL when the market is not in the map (no guessed fallback).
+`hl_execs_halo_mapping.md` §2.3 and §2.4 have the details and the
+regeneration command.
 
 ## 4. Orders feed — event-sourced grain
 
@@ -210,20 +336,34 @@ is the only instrument identifier and uses five distinct formats:
 |-----------------------|---------------|---------------------------|----------------|
 | Plain                 | `BTC`         | `BTC/USDC`                | `SWAP`         |
 | `k`-prefix            | `kPEPE`       | `kPEPE/USDC`              | `SWAP`         |
-| HIP-3 `{dex}:{name}`  | `xyz:SP500`   | `xyz:SP500/USDC`          | `SWAP`         |
-| `@N` spot index       | `@107`        | `@107/USDC` (placeholder) | `SPOT`         |
+| HIP-3 `{dex}:{name}`  | `xyz:SP500`   | `SP500-XYZ/USDC`          | `SWAP`         |
+| HIP-3, non-USDC dex   | `hyna:1000PEPE` | `1000PEPE-HYNA/USDE`    | `SWAP`         |
+| `@N` spot index       | `@107`        | `HYPE/USDC` (resolved from `DEX.TRADES`; `@107/USDC` placeholder if no trade in the lookback) | `SPOT`         |
 | `base/quote`          | `PURR/USDC`   | `PURR/USDC`               | `SPOT`         |
 
-The HIP-3 prefix is deliberately retained: HIP-3 lets independent
-builders deploy their own perp dexes, and market names are **not**
-globally unique. Collapsing `xyz:SP500/USDC` and a hypothetical
-`abc:SP500/USDC` to one `Symbol` would treat them as the same venue,
-which is wrong.
+The HIP-3 form is the executions feed's / production's `TOKEN_A-DEX/TOKEN_B`
+symbology (§3.3), so one contract has one HALO `Symbol` across both feeds.
+The dex is kept in the name because HIP-3 market names are **not**
+globally unique across builder dexes. `RAW.ORDERS` has no token symbols,
+so the quote token comes from `orders_mapping.HIP3_DEX_QUOTE_TOKEN`
+(dex prefix → collateral: USDC for xyz/io/para/mkts/abcd, USDE for hyna,
+USDH for km/flx/vntl, USDT0 for cash, USDC fallback), rendered as a SQL
+`CASE`. It is a hand-kept snapshot; see `hl_orders_halo_mapping.md` §8.2.
 
-`@N` spot indices are an open issue — resolving them to a real
-`base/quote` requires either a join against `DEX.TRADES` or a live
-call to HL's `/info → spotMeta`. Today the placeholder is emitted and
-the raw `@N` is preserved in aux `_Coin` for downstream reconciliation.
+The orders feed also emits `Blockchain = 'ethereum'` and `SymbolType`
+from the same map as executions (§3.3), so both feeds describe an
+instrument identically.
+
+`@N` spot indices are resolved by a `spot_pairs` CTE that groups
+`DEX.TRADES` spot rows by `COIN` over `[start - spot_lookback_days, end)`
+and LEFT JOINs the token symbols and `PAIR` onto the orders (same strings
+the executions feed emits, so both feeds agree on `Symbol` and
+`ExchangeSymbol`). The lookback (default 30 days,
+`--spot-lookback-days`) bounds the scan; a pair with no trade in the
+window keeps the `@N/USDC` placeholder, and the exporter counts those
+rows and pairs (`OrdersExportResult.unresolved_spot_coins`) and prints a
+warning. The raw `@N` stays in aux `_Coin`. See
+`hl_orders_halo_mapping.md` §5.1.
 
 ### 4.6 TP/SL bracket orders (OCO)
 
@@ -271,12 +411,30 @@ on `BUYER_ORDER_ID` / `SELLER_ORDER_ID` to compare against the order's
 ignore. `CanceledFill` / `AmendFill` don't apply to HL: on-chain CLOB
 trades are final.
 
+### 5.3 SymbolType map is generated, not hand-edited
+
+The map lives in production as `R__06b_symbol_type_map.sql` (itself
+generated from the `hyperliquid_perps_universe.xlsx` workbook).
+`hyperliquid_halo.sync_symbol_type_map` parses that SQL, validates it
+(no duplicate coins, every value in the HALO `SymbolType` enum, no
+characters that would break a SQL literal) and rewrites
+`symbol_type_map.py`. Regenerate whenever production regenerates; the
+mirror is committed so the exporter has no runtime dependency on the
+production repo. Markets missing from the map ship with an empty
+`SymbolType` in both places.
+
+### 5.4 `Blockchain = 'ethereum'` on both feeds
+
+HALO's supported Blockchain list has no Hyperliquid value. Both feeds
+emit `ethereum` (HL accounts are EVM addresses), matching production.
+The orders feed emitted the invalid `hyperliquid` until 2026-09-21.
+
 ## 6. Output file conventions
 
 | File                | Schema                                                        | Join key (back to aux)       |
 |---------------------|---------------------------------------------------------------|------------------------------|
-| `halo.csv`          | `mapping.HALO_COLUMNS` — strict v2.1 Execution Data + `IsMaker`| `Id`                         |
-| `aux.csv`           | `mapping.AUX_COLUMNS`                                         | (joined on `Id`)             |
+| `halo.csv`, or `{prefix}_LINKED_PRIVATE_EXECUTION_V2_DDMMYYYY_partN.csv` when packaged | `mapping.HALO_COLUMNS`: v2.1 Execution Data in production column order (`TransactTime` .. `SymbolType`) + `IsMaker`; `mapping.HALO_STRICT_COLUMNS` (no `IsMaker`) under `--halo-strict` | `Id`                         |
+| `aux.csv`, or `aux/<same part name>` when packaged | `mapping.AUX_COLUMNS`                              | (joined on `Id`)             |
 | `halo_orders.csv`   | `orders_mapping.HALO_ORDER_COLUMNS` — strict v2.1 Order Data  | `(Id, TransactTime)`         |
 | `aux_orders.csv`    | `orders_mapping.AUX_ORDER_COLUMNS`                            | (joined on `Id, TransactTime`)|
 
@@ -326,18 +484,26 @@ HAVING distinct_qtys > 1;
 For CSV-level conformance, run the Solidus `validate-schema` skill:
 
 ```bash
-validate-schema --csv data/<run>/halo.csv
-validate-schema --csv data/<run>/halo_orders.csv
+validate-schema --csv output/<run>/halo.csv
+validate-schema --csv output/<run>/halo_orders.csv
 ```
+
+The executions exporter runs production's nine DQ checks itself on
+every export (§3.5), so the SQL above is only needed when re-checking a
+file after the fact.
 
 ## 8. Tooling
 
 - **Tests** (`tests/`) use a `_FakeCursor` double — no Snowflake
-  connection is opened. Both `mapping` / `orders_mapping` SQL assembly
-  and both exporters' CSV writes are covered. Run with `pytest` after
-  `pip install -e ".[dev]"`.
+  connection is opened. Both `mapping` / `orders_mapping` SQL assembly,
+  both exporters' CSV writes, the DQ checker and the SymbolType map
+  generator are covered. Run with `pytest` after `pip install -e ".[dev]"`.
 - **VS Code launch configurations** (`.vscode/launch.json`) cover each
-  CLI subcommand for quick debug runs against `.env`.
+  CLI subcommand for quick debug runs against `.env`, an
+  `--include-ineligible` export, and the SymbolType map sync (its
+  `--source` path is relative to the workspace and assumes the
+  production repo sits at `~/Desktop/defi-hyperliquid-halo`; edit it if
+  yours lives elsewhere).
 - **Snowflake auth** is environment-driven (`SNOWFLAKE_*`), supports
   both password and `SNOWFLAKE_AUTHENTICATOR=externalbrowser` SSO.
   See `snowflake_client.py` for the supported envar set.

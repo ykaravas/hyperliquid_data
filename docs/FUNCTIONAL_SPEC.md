@@ -27,7 +27,7 @@ mapping docs:
 
 ```
 src/hyperliquid_halo/
-├── snowflake_client.py      # connection helper (env-driven, supports password / SSO)
+├── snowflake_client.py      # connection helper (env-driven: key-pair, SSO, or password; role defaults to DEV_READER)
 ├── mapping.py               # executions: SQL template + QueryParams + LIST_MARKETS_SQL
 ├── exporter.py              # executions: streams query → halo.csv + aux.csv
 ├── orders_mapping.py        # orders: SQL template + OrdersQueryParams + LIST_ORDER_COINS_SQL
@@ -504,9 +504,11 @@ file after the fact.
   `--source` path is relative to the workspace and assumes the
   production repo sits at `~/Desktop/defi-hyperliquid-halo`; edit it if
   yours lives elsewhere).
-- **Snowflake auth** is environment-driven (`SNOWFLAKE_*`), supports
-  both password and `SNOWFLAKE_AUTHENTICATOR=externalbrowser` SSO.
-  See `snowflake_client.py` for the supported envar set.
+- **Snowflake auth** is environment-driven (`SNOWFLAKE_*`) and resolves
+  key-pair (`SNOWFLAKE_PRIVATE_KEY_PATH`), then
+  `SNOWFLAKE_AUTHENTICATOR=externalbrowser` SSO, then password, in that
+  order; `SNOWFLAKE_ROLE` defaults to the read-only `DEV_READER`. See
+  `snowflake_client.py` for the supported envar set.
 
 ## 9. Pointers
 

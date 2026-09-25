@@ -44,8 +44,6 @@ pip install -r requirements.txt
 pip install -e .           # exposes the `hyperliquid-halo` console script
 ```
 
-Run `MfaAwsSSOtoken.sh` script in terminal to be able to access snowflake.
-
 Copy the Snowflake env template and fill in your credentials:
 
 ```bash
@@ -53,8 +51,63 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-`SNOWFLAKE_AUTHENTICATOR=externalbrowser` is supported for SSO and avoids
-having to put a password in `.env`.
+### Snowflake authentication
+
+The client resolves credentials in this order:
+
+1. `SNOWFLAKE_PRIVATE_KEY_PATH` set: key-pair (JWT) auth, no password read.
+2. `SNOWFLAKE_AUTHENTICATOR=externalbrowser`: Okta SSO in the browser, no password.
+3. `SNOWFLAKE_PASSWORD`: plain password auth.
+
+The shared service-user password stopped working on 2026-09-22, so every
+connection runs as your own login (`SNOWFLAKE_USER=first.last@soliduslabs.com`).
+Key-pair auth is the active, primary route: the author's public key was
+registered on 2026-09-23, `.env` sets `SNOWFLAKE_PRIVATE_KEY_PATH`, and no
+browser login happens. The client uses the key whenever
+`SNOWFLAKE_PRIVATE_KEY_PATH` is set and then ignores both the authenticator
+and the password. `SNOWFLAKE_ROLE` defaults to `DEV_READER`, the read-only
+role, and every project that talks to Snowflake uses it.
+
+Okta SSO (`SNOWFLAKE_AUTHENTICATOR=externalbrowser`) stays configured as the
+fallback for anyone without a registered key, and is where a new user starts
+until an admin registers their key. Each process opens the browser once; the
+id token is cached in the macOS keychain because `requirements.txt` installs
+the connector's `secure-local-storage` extra, so a loop of exports inside one
+process logs in once.
+
+Snowflake needs an **RSA** key (2048-bit or more) in **PKCS#8 PEM** form. Keys
+from `ssh-keygen` do not qualify as generated (OpenSSH format, and Ed25519 is
+not RSA), so make the pair with OpenSSL:
+
+```bash
+# private key (PKCS#8, unencrypted; add "-v2 aes256" instead of "-nocrypt" for a passphrase)
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -out ~/.ssh/snowflake_rsa_key.p8
+chmod 600 ~/.ssh/snowflake_rsa_key.p8
+# public key
+openssl rsa -in ~/.ssh/snowflake_rsa_key.p8 -pubout -out ~/.ssh/snowflake_rsa_key.pub
+# the value to hand to the Snowflake admin (header, footer and line breaks removed)
+grep -v -- "-----" ~/.ssh/snowflake_rsa_key.pub | tr -d '\n'
+```
+
+A Snowflake admin (SECURITYADMIN or higher) registers the public key on the
+user, which is the only step you cannot do yourself:
+
+```sql
+ALTER USER "FIRST.LAST@SOLIDUSLABS.COM" SET RSA_PUBLIC_KEY='MIIBIjANBg...';   -- the value from the last command
+DESC USER "FIRST.LAST@SOLIDUSLABS.COM";  -- RSA_PUBLIC_KEY_FP shows the registered fingerprint
+```
+
+Then in `.env`:
+
+```
+SNOWFLAKE_PRIVATE_KEY_PATH=~/.ssh/snowflake_rsa_key.p8
+SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=   # only for an encrypted key
+```
+
+If your own key is not registered yet, keep `SNOWFLAKE_PRIVATE_KEY_PATH`
+commented out in `.env` and rely on the SSO fallback. A JWT error (rather than
+"incorrect username or password") means the key path is being used but the key
+is not registered yet.
 
 ## CLI
 
@@ -178,6 +231,13 @@ python -m hyperliquid_halo.sync_symbol_type_map \
 
 Perp markets missing from the map ship with an empty `SymbolType` (no
 guessed fallback), the same as production.
+
+## Upload ledger
+
+`docs/HALO_UPLOAD_LEDGER.md` lists every transact date already shipped to the
+HLRESEARCH tenant, the windows still missing, and the export, upload, and
+ClickHouse verification steps. Check it before uploading; HALO cannot
+de-duplicate a part sent twice.
 
 ## Validating output
 

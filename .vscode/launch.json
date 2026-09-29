@@ -103,6 +103,26 @@
             "justMyCode": true
         },
         {
+            "name": "Export orders: one day, HALO-strict parts, no post-only (2026-03-02)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export-orders",
+                "--start",
+                "2026-03-02",
+                "--end",
+                "2026-03-03",
+                "--halo-strict",
+                "--exclude-post-only",
+                "--out-dir",
+                "${workspaceFolder}/output/orders_20260302"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "List order coins",
             "type": "debugpy",
             "request": "launch",
@@ -174,6 +194,71 @@
                 "--halo-strict",
                 "--out-dir",
                 "${workspaceFolder}/output/btc_perps_halo_strict"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Check coverage: HLRESEARCH (one week)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "check-coverage",
+                "--start",
+                "2026-05-17",
+                "--end",
+                "2026-05-24",
+                "--tenant",
+                "HLRESEARCH"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Export window: HALO strict, coverage-gated (two days)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export-window",
+                "--start",
+                "2026-05-17",
+                "--end",
+                "2026-05-19",
+                "--tenant",
+                "HLRESEARCH",
+                "--out-dir",
+                "${workspaceFolder}/output/halo_strict_20260517_20260518"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true
+        },
+        {
+            "name": "Upload window: HLRESEARCH dry run (two days)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "upload-window",
+                "--start",
+                "2026-05-17",
+                "--end",
+                "2026-05-19",
+                "--tenant",
+                "HLRESEARCH",
+                "--out-dir",
+                "${workspaceFolder}/output/halo_strict_20260517_20260518",
+                "--dry-run"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",

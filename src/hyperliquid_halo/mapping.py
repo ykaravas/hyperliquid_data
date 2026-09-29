@@ -155,8 +155,10 @@ class QueryParams:
             ``OrderID`` / ``MatchingOrderID`` carry the ``-B`` / ``-S`` side
             suffix and ``halo.csv`` drops the non-HALO ``IsMaker`` column
             (:data:`HALO_STRICT_COLUMNS`). Cannot be combined with
-            ``include_ineligible``. Default ``False`` keeps raw order ids so
-            executions join to this project's orders feed.
+            ``include_ineligible``. Default ``False`` keeps raw order ids,
+            which match ``RAW.ORDERS.ORDER_ID`` directly; the orders feed's
+            ``Id`` carries the same ``-B`` / ``-S`` suffix as strict mode,
+            so use strict mode when the two feeds meet inside HALO.
     """
 
     start_ts: datetime
@@ -301,9 +303,10 @@ def _side_cte(
         {other_prefix}_ORDER_ID::STRING || '{match_suffix}'              AS MatchingOrderID,"""
     else:
         order_id_lines = f"""\
-        -- Raw Hyperliquid order ids (no side suffix) so executions stay
-        -- joinable to this project's orders feed (halo_orders.csv Id).
-        -- Production appends '-B'/'-S'; --halo-strict does the same.
+        -- Raw Hyperliquid order ids (no side suffix), matching
+        -- RAW.ORDERS.ORDER_ID for analysis against Allium. Production
+        -- appends '-B'/'-S'; --halo-strict does the same, and so does the
+        -- orders feed's Id (halo_orders.csv), which is what links inside HALO.
         {self_prefix}_ORDER_ID::STRING                                 AS OrderID,
         {other_prefix}_ORDER_ID::STRING                                AS MatchingOrderID,"""
     return f"""{name} AS (

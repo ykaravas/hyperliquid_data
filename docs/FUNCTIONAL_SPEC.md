@@ -12,7 +12,7 @@ Solidus's HALO Trade Surveillance v2.1 ingestion format:
 Both feeds mirror the production Snowflake pipeline in the
 `defi-hyperliquid-halo` repo (`hyperliquid_v_linked_private_execution_v2`
 for executions; production has no orders feed, so the orders feed follows
-the same symbology and enum choices). Parity status and the deliberate
+the same symbology, enum choices and `-B`/`-S` order-id form). Parity status and the deliberate
 divergences are tabulated in `hl_execs_halo_mapping.md` §5.
 
 This file describes **how** the pipelines work — module layout, data
@@ -35,7 +35,10 @@ src/hyperliquid_halo/
 ├── symbol_type_map.py       # GENERATED: per-market HALO SymbolType, mirrored from production
 ├── sync_symbol_type_map.py  # regenerates symbol_type_map.py from production's R__06b SQL
 ├── dq.py                    # executions: streaming mirror of production's DQ-1..DQ-9
-└── cli.py                   # click CLI, 4 subcommands wiring the above
+├── window.py                # per-day HALO-strict export of a window + export_window.jsonl ledger
+├── upload.py                # resume-safe upload of an exported window (halo-upload skill)
+├── coverage.py              # what a tenant already holds per day (ClickHouse, clickhouse-download skill)
+└── cli.py                   # click CLI, 7 subcommands wiring the above
 ```
 
 `symbol_type_map.py` is data, not logic: a 500-row `(coin, symbol_type)`
@@ -58,6 +61,9 @@ CLI subcommands:
 | `export-execs`       | `mapping.build_query`, `exporter.export_to_csv`        | Run the executions mapping and stream the two CSVs.         |
 | `list-order-coins`   | `orders_mapping.LIST_ORDER_COINS_SQL`, `orders_exporter.list_order_coins` | Summarize order activity by `COIN` (with inferred market type). |
 | `export-orders`      | `orders_mapping.build_orders_query`, `orders_exporter.export_orders_to_csv` | Run the orders mapping and stream the two CSVs.             |
+| `check-coverage`     | `coverage.check_coverage`                  | What a HALO tenant already holds per day and per source file (§8.1). |
+| `export-window`      | `coverage.check_coverage`, `window.export_window` | Coverage-gated per-day HALO-strict export with a resumable ledger (§8.2). |
+| `upload-window`      | `upload.upload_window`                     | Resume-safe upload of an exported window, never sending a part twice (§8.3). |
 
 ## 2. Pipeline algorithm (shared shape)
 
@@ -225,8 +231,9 @@ nothing else:
 `halo_strict` and `include_ineligible` are mutually exclusive
 (`QueryParams.__post_init__` raises; the CLI reports a usage error): a
 strict file must contain only what production ships. The default mode
-keeps raw order ids because the orders feed's `Id` is the raw `oid` and
-HALO links executions to orders through `OrderID`.
+keeps raw order ids, which match `RAW.ORDERS.ORDER_ID` directly; the
+orders feed's `Id` carries the same `-B`/`-S` suffix as strict mode
+(§4.8), so strict mode is what links executions to orders inside HALO.
 
 Strict mode also packages the output the way production's `R__09` COPY
 does (§3.6).
@@ -271,8 +278,8 @@ regeneration command.
 row per order. A typical order produces 1–3 rows (e.g. `open → canceled`
 or `open → triggered → filled`, or a single terminal `*Rejected`).
 The mapping emits one HALO order row per source row, with all rows for
-the same `ORDER_ID` sharing the same `Id` (HALO models status
-transitions of an order this way).
+the same `ORDER_ID` sharing the same `Id`, the `oid` plus a `-B`/`-S`
+side suffix (§4.8). HALO models status transitions of an order this way.
 
 ### 4.1 Status enum collapse
 
@@ -291,8 +298,8 @@ SQL collapses HL → HALO via:
 
 The collapse is forward-compatible: any new HL status that appears in
 the future is bucketed as `Canceled` unless its name ends in `Rejected`.
-The original HL status is preserved in aux `_RawStatus` so the
-specific rejection / cancel reason is never lost. See
+The original HL status is carried in HALO `Text` (and in aux
+`_RawStatus`) so the specific rejection / cancel reason is never lost. See
 `hl_orders_halo_mapping.md` §4.4.
 
 ### 4.2 Filtered-out source rows
@@ -306,6 +313,10 @@ clause), before any mapping work:
 - **`TYPE = 'Vault Close'`** — non-user-initiated forced vault unwinds.
   Vaults are out of surveillance scope today; revisit if/when they
   become in scope.
+- **`COIN LIKE '#%'`** — HIP-4 outcome (prediction) markets. Out of
+  scope (2026-09-28); they are also absent from `DEX.TRADES`, so the
+  executions feed never sees their fills. See
+  `hl_orders_halo_mapping.md` §5.7.
 
 See `hl_orders_halo_mapping.md` §8 for the full decisions log.
 
@@ -315,8 +326,10 @@ For `open` (the New row): `TransactTime = ORDER_TIMESTAMP`;
 `OrigTransactTime = NULL`.
 
 For all other status events: `TransactTime = STATUS_CHANGE_TIMESTAMP`;
-`OrigTransactTime = ORDER_TIMESTAMP` (HALO requires every non-New row
-to point back at the original placement time).
+`OrigTransactTime = COALESCE(armed_orders.placed_ts, ORDER_TIMESTAMP)`
+(HALO requires every non-New row to point back at the original placement
+time). The lookup matters because a fired trigger order is re-stamped:
+its rows after `triggered` carry `ORDER_TIMESTAMP` = trigger time (§4.10).
 
 ### 4.4 ALO → `TimeInForce = GoodTillCancel` + `TrdType = PostOnly`
 
@@ -327,10 +340,11 @@ The raw `Alo` is preserved in aux `_RawTif`. ALO accounts for ~97% of
 all order events in production — surveillance models should weight
 this accordingly.
 
-### 4.5 `Symbol` derivation across 5 `COIN` shapes
+### 4.5 `Symbol` derivation across 6 `COIN` shapes
 
 `RAW.ORDERS` has no `MARKET_TYPE` / `TOKEN_A_SYMBOL` columns — `COIN`
-is the only instrument identifier and uses five distinct formats:
+is the only instrument identifier and uses six distinct formats (one of
+them dropped at source, §4.2):
 
 | `COIN` shape          | Example       | Emitted `Symbol`          | `SecurityType` |
 |-----------------------|---------------|---------------------------|----------------|
@@ -340,6 +354,7 @@ is the only instrument identifier and uses five distinct formats:
 | HIP-3, non-USDC dex   | `hyna:1000PEPE` | `1000PEPE-HYNA/USDE`    | `SWAP`         |
 | `@N` spot index       | `@107`        | `HYPE/USDC` (resolved from `DEX.TRADES`; `@107/USDC` placeholder if no trade in the lookback) | `SPOT`         |
 | `base/quote`          | `PURR/USDC`   | `PURR/USDC`               | `SPOT`         |
+| `#N` outcome index    | `#11300`      | (dropped at source, §4.2) | n/a            |
 
 The HIP-3 form is the executions feed's / production's `TOKEN_A-DEX/TOKEN_B`
 symbology (§3.3), so one contract has one HALO `Symbol` across both feeds.
@@ -365,15 +380,20 @@ rows and pairs (`OrdersExportResult.unresolved_spot_coins`) and prints a
 warning. The raw `@N` stays in aux `_Coin`. See
 `hl_orders_halo_mapping.md` §5.1.
 
-### 4.6 TP/SL bracket orders (OCO)
+### 4.6 TP/SL pairs (OCO) by sibling pairing
 
-When a user attaches a TP and an SL to a position, HL records the
-bracket as a single order whose `CHILDREN` JSON contains both legs
-(both sharing the parent's `oid`). The mapping flags these as
-`ContingencyType = OCO` whenever `IS_TAKE_PROFIT_OR_STOP_LOSS = true`
-and preserves the raw `CHILDREN` JSON verbatim in aux `_Children`.
-Brackets are **not** exploded into separate HALO rows today; doing so
-would change row counts. See `hl_orders_halo_mapping.md` §5.2.
+Hyperliquid exposes no pair id for a TP/SL pair, and Allium's
+`IS_TAKE_PROFIT_OR_STOP_LOSS` is HL's `isPositionTpsl` (sized to the
+position), not an OCO marker: 53% of `siblingFilledCanceled` rows have it
+false. The SQL instead builds a `tpsl_pairs` CTE over the `armed_orders`
+lookback (§4.10), grouped by `USER`, `COIN`, `SIDE` and placement
+`ORDER_TIMESTAMP` (both legs are placed in the same block), keeping the
+groups with at least one Stop-type and one Take-Profit-type order. A
+trigger-type row whose keys match a group gets `ContingencyType = OCO`;
+non-trigger rows never do, even if they share the keys. Found the sibling
+for 90% of proven pairs. Brackets stay inline (one HALO row per source
+row); the raw `CHILDREN` JSON stays in aux. See
+`hl_orders_halo_mapping.md` §5.2.
 
 ### 4.7 Market-type filter via COIN-shape inference
 
@@ -382,8 +402,104 @@ filter on, so it's translated to a `COIN`-shape predicate:
 
 - `--market-type spot` → `AND (COIN LIKE '@%%' OR COIN LIKE '%%/%%')`
 - `--market-type perpetuals` → `AND NOT (COIN LIKE '@%%' OR COIN LIKE '%%/%%')`
+- `--exclude-post-only` → `AND (TIME_IN_FORCE IS NULL OR TIME_IN_FORCE <> 'Alo')`
+  (drops the post-only quoting that is 98% of a day's events; the NULL
+  keeps armed trigger rows, which carry no TIF). Applied to the day's
+  rows only, never to the `armed_orders` lookback.
 
 (The doubled `%%` is the pyformat escape from §2.2.)
+
+### 4.8 Row order and the `Id` side suffix
+
+`STATUS_CHANGE_TIMESTAMP` is a block time (about 13 distinct values per
+second), so an order placed and canceled inside one block, or triggered
+and rejected inside one block, yields two rows at the same millisecond;
+7% of rows share `Id` and `TransactTime` with another row of the same
+order. The SQL orders the output by `TransactTime`, `Id`, then a
+lifecycle rank (`open` 0, `triggered` 1, everything else 2) so HALO
+never receives a terminal row ahead of the row it terminates.
+
+`Id` is `ORDER_ID || '-B'` for buys and `ORDER_ID || '-S'` for sells:
+the form production's executions use for `OrderID`, which is the field
+HALO uses to link an execution to its order. The raw `oid` is `Id`
+without its last two characters. Both decided 2026-09-28; see
+`hl_orders_halo_mapping.md` §2, §6 and §8.1.
+
+### 4.9 `CumQty` and `Notional` in exact decimal
+
+`CumQty = ORIGINAL_SIZE - SIZE` and `Notional = OrderQty ×
+LIMIT_PRICE` (USD, since every Hyperliquid quote token is dollar-pegged;
+sent on every row so HALO never has to price the quote token, which it
+cannot do for USDE) are computed after casting the varchar
+columns to `NUMBER(38,12)`. The earlier DOUBLE subtraction produced
+binary artifacts such as `0.060999999999999999` (18 decimals), which
+breach HALO's 12-decimal cap. `TO_VARCHAR` renders the exact result at
+fixed scale (`0.061000000000`), so the SQL trims trailing zeros and a
+bare trailing point with `REGEXP_REPLACE(..., '[.]?0+$', '')`; the
+character class avoids a backslash escape inside the SQL literal.
+
+### 4.10 Fired trigger orders: the `armed_orders` lookback
+
+When a trigger order fires, its later rows keep the `oid` but are
+re-stamped: `ORDER_TIMESTAMP` becomes the trigger time, `IS_TRIGGER` is
+false, `TRIGGER_PRICE` is 0 and `TYPE` stays `Stop Market` (or the other
+trigger types). The day window on `ORDER_TIMESTAMP` therefore puts the
+post-trigger rows in the trigger day's export and the armed rows in the
+placement day's, possibly days apart, so nothing inside the window can
+supply the trigger price.
+
+The `armed_orders` CTE scans `RAW.ORDERS` for `IS_TRIGGER = true` rows
+with `ORDER_TIMESTAMP` in `[start - trigger_lookback_days, end)` (default
+14, bound `trigger_lookup_start`) and aggregates per `ORDER_ID`: the
+trigger price of the latest armed row (`MAX_BY`), the placement time
+(`MIN(ORDER_TIMESTAMP)`), and `USER`, `COIN`, `SIDE`, `TYPE`. The main
+query LEFT JOINs it on `ORDER_ID`. `StopPx` is the looked-up price on
+trigger-type rows; `OrigTransactTime` uses the looked-up placement time;
+`tpsl_pairs` (§4.6) is built from the same CTE and joined on the
+looked-up placement time. A trigger-type row whose order has no armed row
+inside the lookback degrades `OrdType` to `Market` / `Limit`, which keeps
+HALO's "StopPx required on StopLoss / LimitToStop" rule satisfied. See
+`hl_orders_halo_mapping.md` §5.9.
+
+### 4.11 Full-position TP/SL rows: sizing from the position
+
+Position TP/SL orders arrive with `ORIGINAL_SIZE = 0` (sized to the
+position at trigger time) and HALO rejects a zero quantity. The
+`position_keys` CTE collects the zero-size orders of the window (trader,
+market, placement time); `position_fills` reads `DEX.TRADES` over
+`[start - position_lookback_days, end)` for those traders and markets,
+producing the position after each fill from Allium's per-side start
+position (`BUYER_START_POSITION + AMOUNT`, `SELLER_START_POSITION -
+AMOUNT`) and flags each block's tail (the fill whose resulting position
+is no other fill's start position in the same block, via `ARRAY_AGG ...
+OVER (PARTITION BY trader, coin, timestamp)`), because fills in one block
+share a timestamp with no recoverable order; `position_sizes` keeps, per
+order, the latest fill at or before placement, tail first, and its
+`ABS(position)`. The main query LEFT JOINs it on
+`ORDER_ID` and, only where `ORIGINAL_SIZE = 0`, substitutes that size into
+`OrderQty`, `LeavesQty` and `Notional`, and writes it to aux
+`_PositionSize`. Post-trigger rows of the same order carry a real
+`ORIGINAL_SIZE` and are untouched.
+
+The exporter counts sized rows (`sized_from_position_rows`) and rows
+still at zero (`zero_qty_rows`, no resolvable position); with
+`drop_zero_qty` (default, CLI `--drop-zero-qty/--keep-zero-qty`) the
+latter go to aux only, so `row_count` (HALO rows) can be smaller than the
+aux row count. Coverage measured on 2026-03-02: 99.5% of full-position
+stops sized (`hl_orders_halo_mapping.md` §5.8).
+
+### 4.12 HALO-strict packaging for orders (`_HaloOrdersWriter`)
+
+`export-orders --halo-strict` writes the HALO rows as size-capped parts
+named `{prefix}_PRIVATE_ORDER_V2_{DDMMYYYY}_part{N}.csv` (HALO's file type
+for v2.1 order files), rolling once the current part reaches
+`--max-file-mb` (default 499, checked every 1,000 rows). Unlike the
+executions writer (§3.6) the date in the name is the export day, not the
+row's `TransactTime`: rows are selected by `ORDER_TIMESTAMP` day and an
+order's later lifecycle rows can sit months after it, so strict mode
+takes exactly one day per run. The aux file is written once as
+`aux_orders.csv` in both modes, so the `(Id, TransactTime)` join spans
+all parts.
 
 ## 5. Cross-cutting decisions
 
@@ -435,7 +551,7 @@ The orders feed emitted the invalid `hyperliquid` until 2026-09-21.
 |---------------------|---------------------------------------------------------------|------------------------------|
 | `halo.csv`, or `{prefix}_LINKED_PRIVATE_EXECUTION_V2_DDMMYYYY_partN.csv` when packaged | `mapping.HALO_COLUMNS`: v2.1 Execution Data in production column order (`TransactTime` .. `SymbolType`) + `IsMaker`; `mapping.HALO_STRICT_COLUMNS` (no `IsMaker`) under `--halo-strict` | `Id`                         |
 | `aux.csv`, or `aux/<same part name>` when packaged | `mapping.AUX_COLUMNS`                              | (joined on `Id`)             |
-| `halo_orders.csv`   | `orders_mapping.HALO_ORDER_COLUMNS` — strict v2.1 Order Data  | `(Id, TransactTime)`         |
+| `halo_orders.csv`, or `{prefix}_PRIVATE_ORDER_V2_DDMMYYYY_partN.csv` under `--halo-strict` | `orders_mapping.HALO_ORDER_COLUMNS` — strict v2.1 Order Data | `(Id, TransactTime)`         |
 | `aux_orders.csv`    | `orders_mapping.AUX_ORDER_COLUMNS`                            | (joined on `Id, TransactTime`)|
 
 The orders aux file leads with both `Id` and `TransactTime` as the
@@ -492,25 +608,128 @@ The executions exporter runs production's nine DQ checks itself on
 every export (§3.5), so the SQL above is only needed when re-checking a
 file after the fact.
 
-## 8. Tooling
+## 8. Shipping a window to a tenant (`window.py`, `upload.py`, `coverage.py`)
+
+Sending a multi-day window to a HALO tenant used to be two throwaway
+scripts per window. The first upload runner judged success by a substring
+of the skill's log line that never matched, so it re-sent six parts; the
+second copy was only right because someone remembered the fix. These three
+modules make the procedure part of the package so it is the same every time.
+
+### 8.1 Coverage gate (`coverage.py`)
+
+The upload ledger (`HALO_UPLOAD_LEDGER.md`) only knows about this repo's
+uploads. The tenant's own daily pipeline, manual tests and other people's
+backfills are invisible to it, which is how May 19 to 21 2026 were
+double-counted. So the tenant is asked first, through the read-only
+`clickhouse-download` skill:
+
+| Query | Table | Grain | Gives |
+|---|---|---|---|
+| `strict_events_sql` | `strict_events` (`exchange = <tenant>`, `event_type = 'EXECUTION'`) | per `toDate(ts)` | rows and `uniqExact(id)` per day |
+| `raw_files_sql` | `raw_realtime_matched_executions` (`solidus_client = <tenant>`) | per `(toDate(transact_time), orig_file)` | the source files behind those rows, with `min`/`max(data_loaded_at)` |
+
+The tenant name is validated against `^[A-Z0-9_]+$` before it is spliced
+into SQL. The skill writes its result as a CSV file (CRLF on some hosts,
+normalized by the `csv` module). A day with any row is `covered`.
+`CoverageReport.blocked_days(allowed)` is the gate: covered days minus the
+ones the operator allowed explicitly with `--allow-covered` after reading
+the source-file listing, where a ten-row manual test and a full day's load
+are told apart by their row counts and file names.
+
+### 8.2 Per-day export with a ledger (`window.py`)
+
+`export_window(start, end_exclusive, out_dir)` walks the days in order and,
+for each one:
+
+1. skips it when the latest ledger record is `ok` (unless `force`);
+2. deletes every HALO and aux part of that day still on disk. An
+   interrupted export can leave a partial trailing part, and a re-export
+   that rolls parts differently would otherwise leave an orphan with a
+   higher part number next to the new files;
+3. runs `export_to_csv` with `QueryParams(start_ts=<day 00:00 UTC>,
+   end_ts=<next day 00:00 UTC>, halo_strict=True)` and `max_part_mb=499`,
+   the largest cap under HALO's 500 MB limit (production's 250 MB default
+   would make twice the files for no benefit here);
+4. appends one `DayRecord` as a JSON line to `export_window.jsonl`: `day`,
+   `status` (`ok`, `dq_failed` or `error`), `rows`, `parts` (file names in
+   part order), `finished_at`, `seconds`, `error`.
+
+A `DqFailure` or any other exception is captured in the record and the loop
+carries on with the next day; only configuration errors propagate. The
+ledger is append-only and the latest record per day wins, so a failed day
+is simply retried by the next run. Part names sort numerically (`part10`
+after `part9`).
+
+### 8.3 Resume-safe upload (`upload.py`)
+
+`upload_window(settings, days)` reads the export ledger and, per `ok` day,
+sends the parts its record names that are not yet listed in
+`upload_<TENANT>.done`. Three rules give the never-twice guarantee:
+
+1. **One skill invocation per part.** `build_upload_command` passes the
+   exact file name as the skill's `--pattern` (part names hold no glob
+   metacharacters) with `--concurrency 1` and `--yes`, so one invocation
+   covers one file and its exit code speaks for that file alone.
+2. **The exit code is the only verdict.** `upload_part` treats
+   `returncode == 0` as success and nothing else; the skill's `OK`/`FAIL`
+   line is kept as human-readable detail only. Non-zero exits are retried
+   `attempts` times with `retry_wait_seconds` between tries. A part the
+   ledger names but the disk lacks (the operator deletes parts after they
+   are uploaded) fails without any call.
+3. **Done-file first.** `DoneLedger.append` writes and flushes the name the
+   moment its upload succeeds, under a lock, so a process killed mid-day
+   loses nothing already sent, and the next run skips those names.
+
+Days run in date order; the parts of a day run on a `ThreadPoolExecutor`
+with `workers` threads. With `wait_for_export` (the default) the uploader
+polls the export ledger every `poll_seconds` for a day it does not list
+yet, so export and upload can run side by side; with it off such days are
+skipped and reported. `dry_run` computes the plan and calls nothing. The
+skill script comes from `HALO_UPLOAD_SCRIPT` (default
+`~/.claude/skills/halo-upload/script.py`) and runs under this venv's
+interpreter; the tenant API keys stay in the skill's own `.env`.
+
+### 8.4 Exit codes
+
+| Command | 0 | 1 | 2 |
+|---|---|---|---|
+| `check-coverage` | nothing on the tenant | query or configuration error | some day already holds rows |
+| `export-window` | every day ok | a day failed (`dq_failed` or `error`) | the coverage gate blocked the export |
+| `upload-window` | everything sent | a part failed, a day was skipped, or a configuration error | |
+
+## 9. Tooling
 
 - **Tests** (`tests/`) use a `_FakeCursor` double — no Snowflake
   connection is opened. Both `mapping` / `orders_mapping` SQL assembly,
   both exporters' CSV writes, the DQ checker and the SymbolType map
-  generator are covered. Run with `pytest` after `pip install -e ".[dev]"`.
+  generator are covered. The window modules are tested the same way:
+  `export_to_csv` is replaced by a fake that writes empty parts, and the
+  two skills by `subprocess.run` doubles with scripted exit codes, so the
+  ledger, the stale-part cleanup, the exit-code-only verdict, the done-file
+  and the CSV parsing all run offline. Run with `pytest` after
+  `pip install -e ".[dev]"`.
 - **VS Code launch configurations** (`.vscode/launch.json`) cover each
   CLI subcommand for quick debug runs against `.env`, an
-  `--include-ineligible` export, and the SymbolType map sync (its
-  `--source` path is relative to the workspace and assumes the
+  `--include-ineligible` export, the three window commands (coverage
+  check, a two-day gated export, a dry-run upload), and the SymbolType map
+  sync (its `--source` path is relative to the workspace and assumes the
   production repo sits at `~/Desktop/defi-hyperliquid-halo`; edit it if
   yours lives elsewhere).
+- **External skills.** The window commands shell out to two Claude Code
+  skills that keep their own credentials: `halo-upload`
+  (`HALO_UPLOAD_SCRIPT`) and `clickhouse-download`
+  (`CLICKHOUSE_DOWNLOAD_SCRIPT`, run with `CLICKHOUSE_DOWNLOAD_PYTHON`
+  because the repo venv has no `clickhouse-connect`). Their default paths
+  under `~/.claude/skills/` are machine-specific: a known portability
+  hazard, overridable in `.env`.
 - **Snowflake auth** is environment-driven (`SNOWFLAKE_*`) and resolves
   key-pair (`SNOWFLAKE_PRIVATE_KEY_PATH`), then
   `SNOWFLAKE_AUTHENTICATOR=externalbrowser` SSO, then password, in that
   order; `SNOWFLAKE_ROLE` defaults to the read-only `DEV_READER`. See
   `snowflake_client.py` for the supported envar set.
 
-## 9. Pointers
+## 10. Pointers
 
 For field-level mapping detail and the decisions that drove individual
 field choices:

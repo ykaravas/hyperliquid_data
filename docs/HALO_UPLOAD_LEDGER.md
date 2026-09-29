@@ -11,13 +11,71 @@ twice; check this ledger and the ClickHouse counts before re-sending anything.
 | Transact dates (UTC) | Source | Parts | Rows in HALO | Uploaded (UTC) | Verified |
 |---|---|---|---|---|---|
 | 2026-01-12 to 2026-01-16 | this repo, `output/halo_strict_20260112_20260116/` | 71 | 28,839,276 | 2026-09-22 (live route; the first attempt via the historical route only parked copies) | 2026-09-22 17:10, every day at target, ids distinct |
+| 2026-04-20 to 2026-04-26 | this repo, `output/halo_strict_20260420_20260426/` (first window shipped with `export-window` / `upload-window`) | 65 (44 GB) | 50,963,506 exported, DQ clean every day; coverage check before export found nothing on the tenant for these days | 2026-09-27 23:17 to 2026-09-28 00:38 UTC (live route; 65 parts sent once each, no retries, 34 objects under `date=2026-09-27/` and 31 under `date=2026-09-28/`) | 2026-09-28 01:51 UTC, every day at target, ids distinct, one source file per part (65) and nothing else on these days; loading finished about 70 minutes after the last upload |
 | 2026-04-27 to 2026-05-04 | this repo, `output/halo_strict_20260427_20260516/` | 75 | 58,611,202 | 2026-09-22 23:44 to 2026-09-23 00:30 | 2026-09-23 14:05, every day at target, ids distinct |
 | 2026-05-05 to 2026-05-16 | this repo, `output/halo_strict_20260427_20260516/` | 135 (61 GB) | 106,556,140 exported, DQ clean every day | 2026-09-23 19:23 to 22:45 (live route; all 135 parts in S3 with matching sizes) | 2026-09-24 01:16, every day at target, ids distinct; whole Apr 27 to May 16 window = 165,167,342 rows, ids distinct |
 | 2026-05-17 to 2026-05-21 | this repo, `output/halo_strict_20260517_20260521/` | 60 (27 GB) | 47,459,638 exported, DQ clean every day | 2026-09-24 21:47 to 23:32 (live route; all 60 parts in S3 once, sizes matching, no retries) | May 17 and 18 verified 2026-09-25 (this repo's rows exactly at target, ids distinct; only a few test rows pre-existed). May 19, 20 and 21 already held a copy each, so those days are double-counted until Solidus purges one copy (loading of this repo's files finished 2026-09-25 01:53); see Housekeeping |
 | 2026-05-19 onward | Solidus production pipeline (`defi-hyperliquid-halo`), daily, not from this repo | n/a | n/a | May 19 loaded 2026-05-20, May 20 loaded 2026-05-21, intraday loads from 2026-05-21 04:00 UTC onward; all with the old id format `tradeid-B`/`-S` at first, and a 2026-08-28 backfill in the current format for rows the old gate missed; not May 22 as first assumed | owned by the pipeline |
 
 Not uploaded by anyone as far as this repo knows: 2026-01-01 to 2026-01-11
-and 2026-01-17 to 2026-04-26.
+and 2026-01-17 to 2026-04-19.
+
+## Orders (planned, nothing uploaded yet)
+
+The orders feed has not been sent to any tenant. Decided 2026-09-29: the
+tenant for orders is `HLRESEARCH` too, file type `PRIVATE_ORDER_V2` through
+the live route, and nothing goes up until three things are settled: the
+window commands learn the orders feed (part names, file type, coverage
+against `event_type = 'ORDER'`, a separate done-file), and Solidus answers
+two questions recorded in `hl_orders_halo_mapping.md` §8.2 (#8, whether
+`OrderQty = 0` on full-position stops is accepted; #12, whether HALO wants
+the post-only quoting traffic at all).
+
+| Order day (UTC) | Source | Parts | Rows | Status |
+|---|---|---|---|---|
+| 2026-03-02 | this repo, `output/orders_20260302/` (`export-orders --halo-strict --exclude-post-only`, regenerated 2026-09-29 15:34 UTC with `Notional` and position-sized stops, block-tail rule) | 24 `sdny_PRIVATE_ORDER_V2_02032026_partN.csv` (499 MB each, 11.9 GB) plus one `aux_orders.csv` (7.8 GB, 31,261,154 rows) | 31,257,506 in the HALO parts: 31,261,154 events without post-only quoting, of which 143,128 full-position stops were sized from the trader's position and 3,649 with no resolvable or flat position were withheld (they stay in aux); the full day is 1,546,618,738 | **not uploaded to HLRESEARCH**; the first version's part 1 (before `Notional` and sizing) was sent by hand to the test tenant `SDNYTEST` (below) |
+
+**SDNYTEST test upload, 2026-09-29 15:24 UTC (part 1 only, by hand).** HALO
+ingests row by row: 1,336,711 of the part's 1,354,000 rows loaded into
+`strict_events` (`exchange = 'SDNYTEST'`, `event_type = 'ORDER'`) and 17,289
+were rejected, fully explained by two errors:
+
+| Error (Data Audit export) | Rows in part 1 | Cause |
+|---|---|---|
+| `General error [Error getting market data for symbol USDE]` | 12,371 (every row quoted in USDE, the `hyna` HIP-3 dex; `BTC-HYNA/USDE` and so on) | HALO has no market data for the quote token USDE. USDH and USDT0 rows loaded. Rows without `Price` failed too, so the lookup is per instrument, not per priced row. Executions quoted in USDE load fine on HLRESEARCH (234,378 rows in the April 20 to 26 window) and they carry `Notional`; the orders feed sends none. |
+| `Value must be positive number in field [orderQty]` | 5,019 (every `OrderQty = 0` row: full-position TP/SL, §5.8 of the orders mapping) | HALO rejects a zero quantity outright. |
+
+101 rows had both problems (12,371 + 5,019 - 101 = 17,289). The Data Audit
+export lists at most 1,000 row identifiers per file (712 + 288 here), so it
+understates large problems; a `Row Identifier` N is data row N + 1 of the
+CSV (line N + 2 counting the header).
+
+**Test file for the USDE fix (not yet uploaded).** `output/orders_test_usde_20260302/sdny_PRIVATE_ORDER_V2_02032026_part1.csv`:
+the `hyna:BTC` market only (`BTC-HYNA/USDE`) for 2026-03-02, post-only
+excluded, `Notional` populated on every row (decision 21 of the orders
+mapping) and its 1,794 full-position stops sized from the trader's
+position (decision 22). 42,371 rows, about 16 MB, no zero quantity left.
+Every one of these rows was refused on the first SDNYTEST attempt (USDE
+market data, or zero quantity), so the Data Audit result on this file is
+a clean yes or no on both fixes. The 24-part March 2 day above was
+regenerated with the same code.
+
+Per Solidus's instructions (`solidus_batch_file_upload_instructions.pdf`),
+the first orders upload should be a small representative sample checked in
+HALO's Data Audit tab before the full set, which is also the cheapest way to
+learn whether a zero `OrderQty` is accepted.
+
+Per-day targets for the April 20 to 26 window (rows the exporter wrote):
+
+| Date | Rows | Parts |
+|---|---|---|
+| 2026-04-20 | 8,660,378 | 11 |
+| 2026-04-21 | 8,066,392 | 10 |
+| 2026-04-22 | 8,139,178 | 10 |
+| 2026-04-23 | 9,442,602 | 12 |
+| 2026-04-24 | 8,403,564 | 11 |
+| 2026-04-25 | 3,699,044 | 5 |
+| 2026-04-26 | 4,552,348 | 6 |
 
 Per-day targets for the May 5 to 16 window (rows the exporter wrote):
 
@@ -107,7 +165,9 @@ data for 12:00 to 12:05 and could go too.
 
 - **Lesson:** before exporting a window, query `strict_events` for the tenant
   and date range first; "not uploaded" in this ledger only covers uploads
-  from this repo.
+  from this repo. Since 2026-09-25 `hyperliquid-halo check-coverage` runs
+  that query per day and per source file, and `export-window` refuses a
+  day that already holds rows.
 
 - **May 5 duplicate copies (2026-09-23).** A bug in the first version of the
   upload runner re-sent May 5 parts 1 to 6 after they had already uploaded, so
@@ -126,27 +186,65 @@ data for 12:00 to 12:05 and could go too.
 
 ## How a window gets there
 
-1. Export strict parts (499 MB cap so every file stays under the 500 MB
-   uploader limit):
+The three `hyperliquid-halo` window subcommands do all of this (README,
+"Shipping a window to a tenant"); since 2026-09-25 nothing is scripted by
+hand per window. The windows above were shipped with the hand-written
+predecessors of these commands, which the output folders no longer hold.
+
+1. Ask the tenant what it already holds, per day and per source file. This
+   is the May 19 to 21 lesson: "not uploaded" here only covers this repo.
 
    ```bash
-   hyperliquid-halo export-execs --start 2026-05-05 --end 2026-05-06 \
-     --halo-strict --max-file-mb 499 --out-dir output/halo_strict_20260427_20260516
+   hyperliquid-halo check-coverage --start 2026-05-17 --end 2026-05-22 --tenant HLRESEARCH
    ```
 
-   For a multi-day window use the single-process driver in the output folder
-   (`run_export_driver.py START [END]`), which opens one Snowflake session for
-   the whole run and writes one `===== end day` line per date with the row
-   count and DQ result.
+2. Export day by day in HALO-strict mode with 499 MB parts (every file stays
+   under the 500 MB uploader limit). The command runs the same coverage
+   check first and refuses any day that already holds rows
+   (`--allow-covered <date>` overrides one day at a time, after reading the
+   source files). Each day's outcome goes to `export_window.jsonl` in the
+   output folder; re-running skips days already marked ok.
 
-2. Upload with the `halo-upload` skill through the live route (file type
-   `LINKED_PRIVATE_EXECUTION_V2`, no `--historical`). Files land in
+   ```bash
+   hyperliquid-halo export-window --start 2026-05-17 --end 2026-05-22 \
+     --tenant HLRESEARCH --out-dir output/halo_strict_20260517_20260521
+   ```
+
+3. Upload through the live route (file type `LINKED_PRIVATE_EXECUTION_V2`
+   for executions, `PRIVATE_ORDER_V2` for orders once the commands know that
+   feed; never `--historical`). One `halo-upload` call per part, success
+   judged by exit code only, every success recorded at once in
+   `upload_HLRESEARCH.done`, so a restart never re-sends a part. It can run
+   while step 2 is still exporting; it waits for each day's ledger record.
+
+   Solidus's own rules for these files are in
+   `solidus_batch_file_upload_instructions.pdf` (Help Center, saved
+   2026-09-29): name them `<org>_<fileType>_<DDMMYYYY>_part<N>.csv` with
+   nothing but letters, digits and underscores before `.csv`; keep every
+   file under 500 MB and put the column header in every split; files of
+   similar size between 50 and 300 MB process best (our 499 MB parts have
+   worked on every window so far); request a one-time upload link per
+   file (valid 15 minutes) and PUT the file to it; `list-files` shows what
+   arrived; the Data Audit tab shows processed versus error records per
+   file, and ingestion runs hourly. The document also says files older than
+   7 days should carry `historical_order` / `historical_execution` in the
+   name for the historic route; in practice the historic route only parks
+   files (see the January window above) while the live route ingests any
+   age, so this repo keeps using the live route. Ingestion is not the same
+   as alerting: the TS batch algos only process transact times within the
+   last 24 hours, and an algo run over older data is a historic run that
+   Solidus schedules on request.
+
+   ```bash
+   hyperliquid-halo upload-window --start 2026-05-17 --end 2026-05-22 \
+     --tenant HLRESEARCH --out-dir output/halo_strict_20260517_20260521 --yes
+   ```
+
+   Files land in
    `s3://solidus-file-watcher-uat-eu-central-1/solidusClient=HLRESEARCH/fileType=linked_private_execution_v2/date=<upload date>/`
-   and are ingested automatically whatever the data age. Use `--pattern` and
-   `--exclude` so that only the new parts are sent when the output folder
-   already holds uploaded ones. Dry-run first and confirm the tenant line.
+   and are ingested automatically whatever the data age.
 
-3. Verify in ClickHouse (`clickhouse-download` skill, `--env uat-eu`,
+4. Verify in ClickHouse (`clickhouse-download` skill, `--env uat-eu`,
    `--database solidus_uat_eu`). The raw table fills in about 10 to 25 minutes
    per sweep and `strict_events` a few minutes later; large windows take a few
    hours of hourly loader sweeps.
@@ -164,4 +262,4 @@ data for 12:00 to 12:05 and could go too.
    endpoint resets connections, ping the other configured hosts; when they
    answer, the outage is that service, so wait instead of re-uploading.
 
-4. Record the window here: dates, part count, rows, upload time, verification.
+5. Record the window here: dates, part count, rows, upload time, verification.

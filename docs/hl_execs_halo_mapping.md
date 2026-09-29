@@ -258,7 +258,7 @@ sides of a trade are adjacent.
 | `TransactTime`              | `DATE_PART(EPOCH_MILLISECOND, TIMESTAMP)::BIGINT` | ms since epoch (HALO requirement). |
 | `Id`                        | `REPLACE(UNIQUE_ID, ' ', 'T') \|\| '-B'`     | HALO requires per-side unique ids; `TRADE_ID` alone collides across coins (see §1). |
 | `MatchingID`                | `REPLACE(UNIQUE_ID, ' ', 'T') \|\| '-S'`     | Cross-reference to the counterparty side. |
-| `OrderID`                   | `BUYER_ORDER_ID::STRING` (default) / `BUYER_ORDER_ID::STRING \|\| '-B'` (`--halo-strict`) | Required. Default keeps the raw Hyperliquid `oid` so it joins to `halo_orders.csv` `Id`; strict mode reproduces production's side suffix (§3.2). |
+| `OrderID`                   | `BUYER_ORDER_ID::STRING` (default) / `BUYER_ORDER_ID::STRING \|\| '-B'` (`--halo-strict`) | Required. Default keeps the raw Hyperliquid `oid` (matches `RAW.ORDERS.ORDER_ID` directly); strict mode reproduces production's side suffix, which since 2026-09-28 is also the orders feed's `Id` form (§3.2). |
 | `MatchingOrderID`           | `SELLER_ORDER_ID::STRING` (default) / `... \|\| '-S'` (`--halo-strict`) | Required when `ExecutionType = EXCHANGE`. Same rule as `OrderID`. |
 | `ExecutionType`             | literal `'EXCHANGE'`                         | Hyperliquid is a CLOB exchange. |
 | `Symbol`                    | see §2                                       | ≤ 41 chars. |
@@ -325,12 +325,13 @@ being parsed as literal `null` strings by the HALO uploader. Omitted:
   with the aux parts under `aux/`.
 
 Nothing else changes: ids, symbols, `SymbolType`, `PositionEffect` and the
-gate are identical in both modes. The default mode exists because this
-project also ships an orders feed whose `Id` is the raw `oid`, and HALO
-links an execution to its order through `OrderID`; a strict-mode
-execution (`oid-B`) does not link to that order row. Use strict mode for
-files that go to HALO alongside production output, and the default when
-orders and executions from this repo are analysed together.
+gate are identical in both modes. The default mode keeps the raw `oid`
+for analysis against Allium, where `RAW.ORDERS.ORDER_ID` has no suffix.
+HALO links an execution to its order through `OrderID`, and since
+2026-09-28 the orders feed's `Id` is `oid-B` / `oid-S` (the production
+form), so a strict-mode execution links to its order row inside HALO and
+a default-mode one does not. Use strict mode for every file that goes to
+HALO.
 
 ## 4. Supplementary (aux) fields
 
@@ -380,7 +381,7 @@ Aligned items were verified by running both exporters end to end against
 | `Blockchain` | `ethereum` | Same | Aligned (2026-08-24) |
 | `ExchangeSymbol`, `ContractMultiplier`, `ParentOrderId`, constants | as documented in §3 | Same | Aligned |
 | Column order | `TransactTime` .. `SymbolType` | Same, then `IsMaker` | Aligned |
-| `OrderID` / `MatchingOrderID` | `{oid}-B` / `{oid}-S` | raw `{oid}` by default; `{oid}-B` / `{oid}-S` under `--halo-strict` | Aligned under `--halo-strict` (2026-09-21). The default keeps raw ids because this project also ships an orders feed whose `Id` is the raw `oid`, and HALO links an execution to its order through `OrderID`. Production has no orders feed; its suffix has no recorded rationale (present since the first commit). See §3.2. |
+| `OrderID` / `MatchingOrderID` | `{oid}-B` / `{oid}-S` | raw `{oid}` by default; `{oid}-B` / `{oid}-S` under `--halo-strict` | Aligned under `--halo-strict` (2026-09-21). The default keeps raw ids for analysis against Allium. The orders feed's `Id` uses the same `-B` / `-S` form as of 2026-09-28, so strict-mode executions link to it inside HALO. Production has no orders feed; its suffix has no recorded rationale (present since the first commit). See §3.2. |
 | `IsMaker` | not emitted | extra trailing column by default; not written under `--halo-strict` | Aligned under `--halo-strict`. HALO ignores unknown columns either way. |
 | Liquidation fills marked by `LIQUIDATED_USER` (ordinary `Close *` directions) | pass the gate, ship as `RegularTrade` | same | Aligned, but a probable production gap (§2.5): 280,609 such trades in 2026-09-01..20 versus 253 `Liquidated ...` direction sides. |
 | DQ checks DQ-1..DQ-9 | `R__08`, run before COPY; FAIL aborts, DQ-9 warns | `dq.py`, same checks over the streamed rows; FAIL removes the files under `--halo-strict`, otherwise reported | Aligned (2026-09-21), see §2.6 |

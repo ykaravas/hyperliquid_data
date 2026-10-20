@@ -207,3 +207,25 @@ def test_settings_reject_nonsense(tmp_path: Path) -> None:
         _settings(tmp_path, tenant="  ")
     with pytest.raises(upload.UploadConfigError):
         _settings(tmp_path, attempts=0)
+
+
+def test_only_limits_the_run_to_named_parts_and_flags_unknown_names(tmp_path: Path) -> None:
+    """--only sends the named parts, records them, skips the rest, and fails on a typo."""
+    _exported(tmp_path)
+    run = _FakeRun({PART1: [0]})
+    summary = upload.upload_window(_settings(tmp_path), [DAY], only=[PART1], run=run,
+                                   sleep=lambda _: None)
+    assert summary.ok and summary.sent == (PART1,) and summary.already_done == ()
+    assert [c[c.index("--pattern") + 1] for c in run.commands] == [PART1]
+    assert upload.read_done(upload.done_file_path(tmp_path, "HLRESEARCH")) == {PART1}
+
+    # The full run afterwards sends only what the sample did not.
+    run = _FakeRun({PART2: [0]})
+    summary = upload.upload_window(_settings(tmp_path), [DAY], run=run, sleep=lambda _: None)
+    assert summary.sent == (PART2,) and summary.already_done == (PART1,)
+
+    # A name no record lists is a failure, never a silent no-op.
+    summary = upload.upload_window(_settings(tmp_path), [DAY], only=["typo.csv"],
+                                   run=_FakeRun({}), sleep=lambda _: None)
+    assert not summary.ok and summary.sent == ()
+    assert summary.failed[0].name == "typo.csv" and summary.failed[0].attempts == 0

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
+from .feeds import EXECUTIONS, Feed
 from .window import iter_days
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,8 @@ DEFAULT_CH_ENV = "uat-eu"
 DEFAULT_CH_DATABASE = "solidus_uat_eu"
 
 STRICT_EVENTS_TABLE = "strict_events"
-RAW_EXECUTIONS_TABLE = "raw_realtime_matched_executions"
+RAW_EXECUTIONS_TABLE = EXECUTIONS.raw_table
+"""Raw table of the executions feed (kept for callers that name it directly)."""
 
 _TENANT_RE = re.compile(r"^[A-Z0-9_]+$")
 RunFn = Callable[..., subprocess.CompletedProcess[str]]
@@ -113,10 +115,18 @@ class DayCoverage:
 
 @dataclass(frozen=True)
 class CoverageReport:
-    """Coverage of every day in the requested range, in date order."""
+    """Coverage of every day in the requested range, in date order.
+
+    Attributes:
+        tenant: HALO tenant name.
+        days: One entry per requested day.
+        feed: Name of the feed the counts refer to (``executions`` or
+            ``orders``).
+    """
 
     tenant: str
     days: tuple[DayCoverage, ...]
+    feed: str = EXECUTIONS.name
 
     @property
     def covered_days(self) -> tuple[DayCoverage, ...]:
@@ -169,25 +179,27 @@ def _validate_tenant(tenant: str) -> str:
     return cleaned
 
 
-def strict_events_sql(tenant: str, start: date, end_exclusive: date) -> str:
-    """Rows and distinct ids per transact date in ``strict_events``."""
+def strict_events_sql(
+    tenant: str, start: date, end_exclusive: date, feed: Feed = EXECUTIONS
+) -> str:
+    """Rows and distinct ids per transact date in ``strict_events`` for one feed."""
     last = end_exclusive - timedelta(days=1)
     return (
         "SELECT toDate(ts) AS day, count() AS rows, uniqExact(id) AS distinct_ids "
         f"FROM {STRICT_EVENTS_TABLE} "
-        f"WHERE exchange = '{_validate_tenant(tenant)}' AND event_type = 'EXECUTION' "
+        f"WHERE exchange = '{_validate_tenant(tenant)}' AND event_type = '{feed.event_type}' "
         f"AND toDate(ts) BETWEEN '{start.isoformat()}' AND '{last.isoformat()}' "
         "GROUP BY day ORDER BY day"
     )
 
 
-def raw_files_sql(tenant: str, start: date, end_exclusive: date) -> str:
-    """Rows per (transact date, source file) in the raw executions table."""
+def raw_files_sql(tenant: str, start: date, end_exclusive: date, feed: Feed = EXECUTIONS) -> str:
+    """Rows per (transact date, source file) in the feed's raw table."""
     last = end_exclusive - timedelta(days=1)
     return (
         "SELECT toDate(transact_time) AS day, orig_file, count() AS rows, "
         "min(data_loaded_at) AS first_loaded, max(data_loaded_at) AS last_loaded "
-        f"FROM {RAW_EXECUTIONS_TABLE} "
+        f"FROM {feed.raw_table} "
         f"WHERE solidus_client = '{_validate_tenant(tenant)}' "
         f"AND toDate(transact_time) BETWEEN '{start.isoformat()}' AND '{last.isoformat()}' "
         "GROUP BY day, orig_file ORDER BY day, orig_file"
@@ -238,6 +250,7 @@ def check_coverage(
     end_exclusive: date,
     settings: CoverageSettings,
     *,
+    feed: Feed = EXECUTIONS,
     run: RunFn = subprocess.run,
 ) -> CoverageReport:
     """Ask the tenant what it holds for every day of ``[start, end_exclusive)``.
@@ -247,6 +260,7 @@ def check_coverage(
         start: First transact date (inclusive).
         end_exclusive: Day after the last transact date.
         settings: Skill location and environment.
+        feed: Which feed to count (executions by default, or orders).
         run: ``subprocess.run``-compatible callable (injectable for tests).
 
     Returns:
@@ -260,12 +274,13 @@ def check_coverage(
         raise CoverageError(f"end_exclusive ({end_exclusive}) must be after start ({start})")
     tenant = _validate_tenant(tenant)
     per_day: dict[date, dict[str, int]] = {}
-    for row in run_query(strict_events_sql(tenant, start, end_exclusive), settings, run=run):
+    for row in run_query(strict_events_sql(tenant, start, end_exclusive, feed), settings,
+                         run=run):
         per_day[date.fromisoformat(row["day"])] = {
             "rows": int(row["rows"]), "distinct_ids": int(row["distinct_ids"]),
         }
     sources: dict[date, list[SourceFile]] = {}
-    for row in run_query(raw_files_sql(tenant, start, end_exclusive), settings, run=run):
+    for row in run_query(raw_files_sql(tenant, start, end_exclusive, feed), settings, run=run):
         sources.setdefault(date.fromisoformat(row["day"]), []).append(
             SourceFile(orig_file=row["orig_file"], rows=int(row["rows"]),
                        first_loaded=row["first_loaded"], last_loaded=row["last_loaded"])
@@ -279,7 +294,7 @@ def check_coverage(
         )
         for day in iter_days(start, end_exclusive)
     )
-    return CoverageReport(tenant=tenant, days=days)
+    return CoverageReport(tenant=tenant, days=days, feed=feed.name)
 
 
 def short_source(orig_file: str) -> str:
@@ -303,8 +318,8 @@ def format_report(report: CoverageReport, *, max_sources: int = 5) -> str:
     Returns:
         Multi-line text for the terminal.
     """
-    lines = [f"Tenant {report.tenant}: {len(report.covered_days)} of {len(report.days)} day(s) "
-             "already hold rows",
+    lines = [f"Tenant {report.tenant} ({report.feed}): {len(report.covered_days)} of "
+             f"{len(report.days)} day(s) already hold rows",
              f"{'day':<12}{'rows':>14}{'distinct_ids':>14}{'files':>7}  status"]
     for day in report.days:
         status = "COVERED" if day.covered else "empty"

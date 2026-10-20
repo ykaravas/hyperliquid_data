@@ -151,7 +151,7 @@ python -m hyperliquid_halo.cli export-execs \
 |------------------|--------------------------------------------------------------------------------|
 | `--start` *(req)* | Inclusive start date (UTC, `YYYY-MM-DD`).                                     |
 | `--end`   *(req)* | Exclusive end date (UTC, `YYYY-MM-DD`). Must be strictly greater than `--start`. |
-| `--coin`         | Allium `COIN` filter (`BTC`, `ETH`, or a spot pair id like `@4`).              |
+| `--coin`         | Allium `COIN` filter (`BTC`, `ETH`, or a spot pair id like `@4`). Repeat the flag for several markets. |
 | `--market-type`  | `spot` or `perpetuals`. Omit for both.                                         |
 | `--token-a`      | `TOKEN_A_SYMBOL` filter — base token (useful for spot).                        |
 | `--token-b`      | `TOKEN_B_SYMBOL` filter — quote token (useful for spot).                       |
@@ -213,21 +213,23 @@ python -m hyperliquid_halo.cli export-orders \
 |------------------|-----------------------------------------------------------------------------------------------|
 | `--start` *(req)* | Inclusive start date (UTC, `YYYY-MM-DD`) — applied to `ORDER_TIMESTAMP`.                     |
 | `--end`   *(req)* | Exclusive end date (UTC, `YYYY-MM-DD`). Must be strictly greater than `--start`.             |
-| `--coin`         | Allium `COIN` filter (`BTC`, `kPEPE`, `xyz:SP500`, `@107`, `PURR/USDC`).                      |
+| `--coin`         | Allium `COIN` filter (`BTC`, `kPEPE`, `xyz:SP500`, `@107`, `PURR/USDC`). Repeat the flag for several markets (`--coin xyz:CL --coin xyz:NATGAS`). |
 | `--market-type`  | `spot` (matches `@N`-prefixed and `base/quote` COINs) or `perpetuals` (everything else; `#N` outcome markets are dropped at source). Inferred from `COIN` shape — `RAW.ORDERS` has no native market-type column. |
 | `--user`         | Filter by the on-chain `USER` address (useful for per-account analysis).                      |
 | `--out-dir`      | Directory for `halo_orders.csv` + `aux_orders.csv` (default `./output`).                        |
 | `--spot-lookback-days` | Days before `--start` to scan `DEX.TRADES` when resolving `@N` spot pair ids to token symbols (`@107` → `HYPE/USDC`). Default 30. Pairs with no trade in the window keep an `@N/USDC` placeholder and are listed in a warning. |
 | `--trigger-lookback-days` | Days before `--start` to scan `RAW.ORDERS` for the armed rows of trigger orders (default 14). A fired trigger order is re-stamped to its trigger time, so its later rows need the earlier armed rows for `StopPx`, `OrigTransactTime` and OCO pairing; an order armed before the lookback is reported as a plain Market / Limit order. |
 | `--halo-strict` | Package the HALO rows as upload-ready parts named `sdny_PRIVATE_ORDER_V2_DDMMYYYY_partN.csv` (the export day), capped at `--max-file-mb` (default 499) each, with `--file-prefix` (default `sdny`). One day per run. `aux_orders.csv` stays one file. |
-| `--exclude-post-only` | Drop post-only (`TIME_IN_FORCE = Alo`) rows, the market-maker quoting traffic. On 2026-03-02 that was 1.515 billion of 1.547 billion events (98%); without them the day is 31.3 million rows (about 20 GB of CSV) instead of about 1 TB. Gtc, Ioc, market and all trigger orders are kept. |
+| `--exclude-post-only/--include-post-only` | Post-only (`TIME_IN_FORCE = Alo`) rows, the market-maker quoting traffic, are dropped by default. On 2026-03-02 that was 1.515 billion of 1.547 billion events (98%); without them the day is 31.3 million rows (about 20 GB of CSV) instead of about 1 TB. Gtc, Ioc, market and all trigger orders are always kept. `--include-post-only` exports the quoting too, as `TimeInForce = GoodTillCancel` with `TrdType = PostOnly`. `list-order-coins` counts every event, post-only included. |
 | `--position-lookback-days` | Days before `--start` to scan `DEX.TRADES` for the latest fill that gives a trader's position (default 30). Full-position TP/SL orders arrive with size 0, which HALO rejects; their `OrderQty` becomes the trader's position at placement (aux `_PositionSize`). |
 | `--drop-zero-qty/--keep-zero-qty` | Rows whose `OrderQty` is still 0 after the position lookup are withheld from the HALO file by default (HALO rejects a zero quantity); they stay in `aux_orders.csv` and are counted either way. |
 
 `filled` order rows are filtered at source — fills are covered by the
 trades pipeline and HALO order `Status` does not accept `Filled`. `Vault
 Close` orders and `#N` HIP-4 outcome-market rows are also filtered (out
-of scope). `Id` is the Hyperliquid `oid` with the `-B`/`-S` side suffix
+of scope). Post-only quoting is left out by default, so the examples
+above export takers, `Gtc` resting orders and trigger orders; without
+the quoting the file is not a full order book history. `Id` is the Hyperliquid `oid` with the `-B`/`-S` side suffix
 production's executions use for `OrderID`, and rows that share `Id` and
 `TransactTime` (timestamps are block times) are ordered New, Replaced,
 then Canceled/Rejected. See §8 of
@@ -242,24 +244,56 @@ every step is recorded in a ledger file inside the output folder, re-running
 a step skips what is already done, and a part that has been uploaded once is
 never sent again.
 
+Everything is kept per tenant (`src/hyperliquid_halo/tenants.py`, index in
+[`docs/tenants/README.md`](docs/tenants/README.md)). With `--tenant` and no
+`--out-dir`, the window lives in
+`output/<TENANT>/<feed>_<first day>_<last day>/`, and with no
+`--file-prefix` the parts carry the tenant's own prefix (`sdny` on
+`HLRESEARCH`, where the production pipeline's files use it;
+`hlstrategiestest` on `HLSTRATEGIESTEST`). So two tenants can never share
+a folder, a ledger, a done-file or a part name.
+
 ```bash
 # 1. What does the tenant already hold for these dates? (exit 2 if anything)
 python -m hyperliquid_halo.cli check-coverage \
-    --start 2026-05-17 --end 2026-05-22 --tenant HLRESEARCH
+    --start 2026-10-10 --end 2026-10-20 --tenant HLSTRATEGIESTEST
 
 # 2. Export day by day (runs the same check first and refuses covered days)
+#    -> output/HLSTRATEGIESTEST/executions_20261010_20261019/
 python -m hyperliquid_halo.cli export-window \
-    --start 2026-05-17 --end 2026-05-22 --tenant HLRESEARCH \
-    --out-dir ./output/halo_strict_20260517_20260521
+    --start 2026-10-10 --end 2026-10-20 --tenant HLSTRATEGIESTEST
 
 # 3. Upload, one skill call per part; safe to start while step 2 still runs
 python -m hyperliquid_halo.cli upload-window \
-    --start 2026-05-17 --end 2026-05-22 --tenant HLRESEARCH \
-    --out-dir ./output/halo_strict_20260517_20260521
+    --start 2026-10-10 --end 2026-10-20 --tenant HLSTRATEGIESTEST
 ```
+
+Pass `--out-dir` to both `export-window` and `upload-window` to use another
+folder (the windows shipped before 2026-10-20 lived directly under
+`output/`).
 
 For a long window run steps 2 and 3 side by side under `nohup`; the uploader
 polls the export ledger and sends each day as soon as it is marked ok.
+
+The same three commands ship the **orders feed** with `--feed orders`: the
+coverage check counts `event_type = 'ORDER'` rows and reads the orders raw
+table, `export-window` writes `sdny_PRIVATE_ORDER_V2_DDMMYYYY_partN.csv`
+parts plus one `aux_orders_DDMMYYYY.csv` per day (post-only quoting left
+out unless `--include-post-only`), and `upload-window` sends them with file
+type `PRIVATE_ORDER_V2`. Both feeds accept a repeatable `--coin` to limit
+every day to a few markets. Keep the two feeds in separate folders: they
+share the ledger file name.
+
+```bash
+# The three xyz commodity markets, March 1 to 9 2026, orders with quoting included
+python -m hyperliquid_halo.cli export-window --feed orders \
+    --start 2026-03-01 --end 2026-03-10 --tenant HLRESEARCH \
+    --coin xyz:CL --coin xyz:BRENTOIL --coin xyz:NATGAS --include-post-only \
+    --out-dir ./output/xyz_commodities_20260301_20260309/orders
+python -m hyperliquid_halo.cli upload-window --feed orders \
+    --start 2026-03-01 --end 2026-03-10 --tenant HLRESEARCH \
+    --out-dir ./output/xyz_commodities_20260301_20260309/orders
+```
 
 | Command | What it does | Exit codes |
 |---|---|---|
@@ -267,14 +301,19 @@ polls the export ledger and sends each day as soon as it is marked ok.
 | `export-window` | Runs the coverage check, then exports each day as its own `--halo-strict` query with 499 MB parts and appends one JSON line per day (`status`, `rows`, `parts`) to `export_window.jsonl`. Re-running skips days marked `ok` (`--force` re-exports them); stale parts of a day are deleted before it is exported again. | 0 all days ok; 1 a day failed (DQ or error); 2 coverage blocked |
 | `upload-window` | Reads `export_window.jsonl`, sends every part of each `ok` day through the `halo-upload` skill (one call per file, exact name as the pattern, success = exit code 0, 3 attempts), and appends each success to `upload_<TENANT>.done` at once. Re-running sends only what that file does not list. Asks you to confirm the tenant unless `--yes`; `--dry-run` prints the plan. | 0 all sent; 1 a part failed or a day was skipped |
 
-Options worth knowing on `export-window`: `--allow-covered YYYY-MM-DD`
+Options worth knowing on `export-window`: `--feed executions|orders`,
+`--coin` (repeatable) and `--include-post-only` (orders) select what is
+exported; `--allow-covered YYYY-MM-DD`
 (repeatable) exports a day the tenant already holds rows for, after you have
 read the source-file listing and decided those rows are test data;
 `--skip-coverage-check` skips the ClickHouse call entirely and is only for
 when ClickHouse is down and the coverage is already known. On
-`upload-window`: `--no-wait` skips days the ledger does not list instead of
-polling for them; `--workers`, `--attempts`, `--retry-wait` and `--poll`
-tune the run.
+`upload-window`: `--only FILE` (repeatable) sends just the named parts, for
+the sample upload Solidus asks for on a new tenant; the part is recorded in
+the done-file like any other, so the full run later skips it, and a name the
+ledger does not list fails the run instead of passing silently. `--no-wait`
+skips days the ledger does not list instead of polling for them;
+`--workers`, `--attempts`, `--retry-wait` and `--poll` tune the run.
 
 Two external dependencies, both listed in `.env.example`: the `halo-upload`
 skill (`HALO_UPLOAD_SCRIPT`, default `~/.claude/skills/halo-upload/script.py`)
@@ -285,7 +324,8 @@ ClickHouse credentials. This repo never sees either set of secrets. Both
 paths are machine-specific, which is a known portability hazard.
 
 After the upload, verify the row counts in ClickHouse and record the window
-in `docs/HALO_UPLOAD_LEDGER.md`; the procedure and the SQL are in that file.
+in the tenant's ledger, `docs/tenants/<TENANT>/HALO_UPLOAD_LEDGER.md`; the
+procedure and the SQL are in the `HLRESEARCH` one.
 
 ## Keeping the SymbolType map in sync
 
@@ -300,17 +340,24 @@ python -m hyperliquid_halo.sync_symbol_type_map \
     --source ../defi-hyperliquid-halo/db/migrations/hyperliquid/R__06b_symbol_type_map.sql
 ```
 
-Perp markets missing from the map ship with an empty `SymbolType` (no
-guessed fallback), the same as production.
+The map covers perps (keyed by the Allium `COIN`) and, since production's
+2026-10-13 change, spot pairs (keyed by the `BASE/QUOTE` pair name) with
+curated values such as `TokenizedEquity`, `Stablecoin` or `Commodities`;
+before that spot was always `Crypto`. Markets missing from the map ship
+with an empty `SymbolType` (no guessed fallback), the same as production.
 
-## Upload ledger
+## Upload ledgers, one per tenant
 
-`docs/HALO_UPLOAD_LEDGER.md` lists every transact date already shipped to the
-HLRESEARCH tenant, the windows still missing, and the export, upload, and
-ClickHouse verification steps. Check it before uploading; HALO cannot
-de-duplicate a part sent twice. The ledger only knows about this repo's
-uploads, so `export-window` also asks the tenant itself (`check-coverage`)
-and refuses days that already hold rows.
+`docs/tenants/<TENANT>/HALO_UPLOAD_LEDGER.md` lists every transact date
+already shipped to that tenant, the windows still missing, and the export,
+upload, and ClickHouse verification steps; `docs/tenants/README.md` indexes
+the tenants (`HLRESEARCH` since 2026-09, `HLSTRATEGIESTEST` since
+2026-10-20). Check the ledger before uploading; HALO cannot de-duplicate a
+part sent twice. A ledger only knows about this repo's uploads, so
+`export-window` also asks the tenant itself (`check-coverage`) and refuses
+days that already hold rows. The same transact date can legitimately exist on
+both tenants: each receives its own copy of the source data, and the
+coverage check is always per tenant.
 
 ## Validating output
 
@@ -346,6 +393,8 @@ Pre-wired debug launch configurations live in `.vscode/launch.json`:
 - **Export: all markets incl. ineligible (one day)**: research export with the eligibility gate off.
 - **Export: BTC perps (HALO strict, one day)**: production-shaped `halo.csv` (`--halo-strict`).
 - **Sync SymbolType map from production**: regenerate `symbol_type_map.py`; assumes the production repo is at `~/Desktop/defi-hyperliquid-halo` (path is workspace-relative, edit if needed).
+- **Check coverage / Export window / Upload window (HLRESEARCH)**: the three window commands against the first tenant, executions and the xyz orders.
+- **Check coverage / Export window / Upload window dry run: HLSTRATEGIESTEST Oct 10 to 19 2026**: the same three commands for the second tenant, using the tenant-derived output folder and part prefix.
 
 ## Project layout
 
@@ -363,6 +412,9 @@ src/hyperliquid_halo/
     window.py             # per-day HALO-strict export of a window + export_window.jsonl ledger
     upload.py             # resume-safe upload of an exported window via the halo-upload skill
     coverage.py           # what a tenant already holds per day (ClickHouse via clickhouse-download)
+    feeds.py              # the two HALO feeds (file type, event_type, raw table) the window commands switch on
+    tenants.py            # the HALO tenants: part prefix, output/<TENANT>/ folders, ledger location
+    filters.py            # shared SQL filter builders (one or several COINs) for both mapping queries
     cli.py                # click-based entrypoint (7 subcommands)
 tests/
     test_mapping.py
@@ -375,9 +427,12 @@ tests/
     test_window.py
     test_upload.py
     test_coverage.py
+    test_filters.py / test_tenants.py / test_cli.py
 docs/
     FUNCTIONAL_SPEC.md             # repo-flavored architecture + algorithms (both feeds)
-    HALO_UPLOAD_LEDGER.md          # transact dates already on HLRESEARCH, open housekeeping, procedure
+    tenants/README.md              # the tenants: prefix, region, feeds shipped, where each ledger is
+    tenants/HLRESEARCH/HALO_UPLOAD_LEDGER.md       # transact dates on HLRESEARCH, open housekeeping, the procedure
+    tenants/HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md # the second tenant: Oct 10 to 19 2026 executions, exported 2026-10-20
     hl_execs_halo_mapping.md       # portable trades -> HALO Execution mapping (field by field)
     hl_orders_halo_mapping.md      # portable orders -> HALO Order mapping (field by field, + §8 decisions)
     solidus_batch_file_upload_instructions.pdf  # Solidus's own upload rules (file types, naming, 500 MB, API flow, batch timing)

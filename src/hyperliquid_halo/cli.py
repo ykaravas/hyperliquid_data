@@ -13,6 +13,11 @@ Subcommands:
     * ``upload-window``: resume-safe upload of an exported window through
       the halo-upload skill.
 
+    The three window commands keep every tenant apart (:mod:`.tenants`):
+    without ``--out-dir`` a window is exported to and uploaded from
+    ``output/<TENANT>/<feed>_<first day>_<last day>/``, and without
+    ``--file-prefix`` the parts carry the tenant's own prefix.
+
 Typical usage::
 
     python -m hyperliquid_halo.cli export-execs \\
@@ -40,7 +45,7 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
-from . import coverage, upload, window
+from . import coverage, feeds, tenants, upload, window
 from .dq import DqFailure
 from .exporter import DEFAULT_FILE_PREFIX, export_to_csv, list_markets
 from .mapping import QueryParams
@@ -51,6 +56,21 @@ logger = logging.getLogger("hyperliquid_halo")
 
 
 MARKET_TYPE_CHOICES = click.Choice(["spot", "perpetuals"], case_sensitive=False)
+
+
+def _coin_selection(coins: tuple[str, ...]) -> str | tuple[str, ...] | None:
+    """Turn the repeated ``--coin`` values into the exporters' ``coin`` filter.
+
+    Args:
+        coins: Values of every ``--coin`` flag, in the order given.
+
+    Returns:
+        ``None`` when the flag was not used, the bare string for one market
+        (the historical single-market filter), or the tuple for several.
+    """
+    if not coins:
+        return None
+    return coins[0] if len(coins) == 1 else coins
 
 
 def _parse_day(value: str) -> datetime:
@@ -103,8 +123,9 @@ def cli(ctx: click.Context, verbose: bool) -> None:
               help="Inclusive start date (UTC).")
 @click.option("--end", "end_str", required=True, metavar="YYYY-MM-DD",
               help="Exclusive end date (UTC). Must be > --start.")
-@click.option("--coin", default=None,
-              help="Filter by Allium COIN (e.g. BTC, ETH, or a spot pair id like @4).")
+@click.option("--coin", "coins", multiple=True,
+              help="Filter by Allium COIN (e.g. BTC, ETH, or a spot pair id like @4). "
+                   "Repeat the flag to select several markets.")
 @click.option("--market-type", "market_type", type=MARKET_TYPE_CHOICES, default=None,
               help="Filter by market type: 'spot' or 'perpetuals'. Omit for both.")
 @click.option("--token-a", default=None,
@@ -136,7 +157,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 def export_execs_cmd(
     start_str: str,
     end_str: str,
-    coin: str | None,
+    coins: tuple[str, ...],
     market_type: str | None,
     token_a: str | None,
     token_b: str | None,
@@ -154,7 +175,7 @@ def export_execs_cmd(
     params = QueryParams(
         start_ts=_parse_day(start_str),
         end_ts=_parse_day(end_str),
-        coin=coin,
+        coin=_coin_selection(coins),
         market_type=market_type.lower() if market_type else None,
         token_a=token_a,
         token_b=token_b,
@@ -163,7 +184,7 @@ def export_execs_cmd(
     )
     click.echo(
         f"Exporting {params.start_ts.date()} .. {params.end_ts.date()} "
-        f"(coin={coin or 'ALL'}, market_type={market_type or 'ALL'}, "
+        f"(coin={', '.join(coins) or 'ALL'}, market_type={market_type or 'ALL'}, "
         f"eligibility={'off' if include_ineligible else 'production'}, "
         f"mode={'halo-strict' if halo_strict else 'default'}) -> {out_dir}"
     )
@@ -234,8 +255,9 @@ def list_markets_cmd(start_str: str, end_str: str, top: int) -> None:
               help="Inclusive start date (UTC, on ORDER_TIMESTAMP).")
 @click.option("--end", "end_str", required=True, metavar="YYYY-MM-DD",
               help="Exclusive end date (UTC). Must be > --start.")
-@click.option("--coin", default=None,
-              help="Filter by Allium COIN (e.g. BTC, kPEPE, xyz:SP500, @107, PURR/USDC).")
+@click.option("--coin", "coins", multiple=True,
+              help="Filter by Allium COIN (e.g. BTC, kPEPE, xyz:SP500, @107, PURR/USDC). "
+                   "Repeat the flag to select several markets.")
 @click.option("--market-type", "market_type", type=MARKET_TYPE_CHOICES, default=None,
               help="Filter by inferred market type (from COIN shape): "
                    "'spot' (@N or base/quote) or 'perpetuals' (everything else). "
@@ -266,11 +288,12 @@ def list_markets_cmd(start_str: str, end_str: str, top: int) -> None:
               show_default=True, help="Per-part size cap in MB under --halo-strict.")
 @click.option("--file-prefix", default=DEFAULT_FILE_PREFIX, show_default=True,
               help="Prefix of the part names under --halo-strict.")
-@click.option("--exclude-post-only", is_flag=True, default=False,
+@click.option("--exclude-post-only/--include-post-only", default=True, show_default=True,
               help="Drop post-only (TIME_IN_FORCE = Alo) rows, the market-maker quoting "
                    "traffic that is about 98% of a day's order events (1.5 billion rows on "
                    "2026-03-02; 31 million without them). Gtc, Ioc, market and all trigger "
-                   "orders are kept.")
+                   "orders are always kept. --include-post-only exports the quoting too "
+                   "(about 1 TB of CSV for a full day).")
 @click.option("--position-lookback-days", type=click.IntRange(min=0), default=30,
               show_default=True,
               help="Days before --start to scan DEX.TRADES for the latest fill that gives a "
@@ -283,7 +306,7 @@ def list_markets_cmd(start_str: str, end_str: str, top: int) -> None:
 def export_orders_cmd(
     start_str: str,
     end_str: str,
-    coin: str | None,
+    coins: tuple[str, ...],
     market_type: str | None,
     user_addr: str | None,
     out_dir: Path,
@@ -305,12 +328,13 @@ def export_orders_cmd(
     orders and ``#N`` outcome-market rows are dropped (out of scope), and
     full-position TP/SL rows are sized from the trader's position at
     placement; the few still at ``OrderQty`` 0 are withheld from the HALO
-    file unless ``--keep-zero-qty``.
+    file unless ``--keep-zero-qty``. Post-only (``Alo``) quoting is left
+    out unless ``--include-post-only``.
     """
     params = OrdersQueryParams(
         start_ts=_parse_day(start_str),
         end_ts=_parse_day(end_str),
-        coin=coin,
+        coin=_coin_selection(coins),
         market_type=market_type.lower() if market_type else None,
         user=user_addr,
         spot_lookback_days=spot_lookback_days,
@@ -320,7 +344,7 @@ def export_orders_cmd(
     )
     click.echo(
         f"Exporting orders {params.start_ts.date()} .. {params.end_ts.date()} "
-        f"(coin={coin or 'ALL'}, market_type={market_type or 'ALL'}, "
+        f"(coin={', '.join(coins) or 'ALL'}, market_type={market_type or 'ALL'}, "
         f"user={user_addr or 'ALL'}, post_only={'excluded' if exclude_post_only else 'kept'}"
         f"{', HALO-strict parts' if halo_strict else ''}) -> {out_dir}"
     )
@@ -418,6 +442,40 @@ def _window_dates(start_str: str, end_str: str) -> tuple[date, date]:
     return start, end_exclusive
 
 
+def _tenant(name: str | None) -> tenants.Tenant | None:
+    """Resolve ``--tenant`` through the registry (``None`` when the flag was not given).
+
+    Raises:
+        click.UsageError: If the name is not letters, digits and underscores.
+    """
+    if name is None:
+        return None
+    try:
+        return tenants.tenant_by_name(name)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _window_out_dir(
+    out_dir: Path | None,
+    tenant: tenants.Tenant | None,
+    feed: feeds.Feed,
+    start: date,
+    end_exclusive: date,
+) -> Path:
+    """The folder a window lives in: ``--out-dir`` if given, else the tenant's default.
+
+    Raises:
+        click.UsageError: If neither ``--out-dir`` nor ``--tenant`` was given.
+    """
+    if out_dir is not None:
+        return out_dir
+    if tenant is None:
+        raise click.UsageError("--out-dir is required when no --tenant is given (the default "
+                               "folder is output/<TENANT>/<feed>_<first day>_<last day>).")
+    return tenants.default_out_dir(tenant, feed, start, end_exclusive)
+
+
 def _clickhouse_options(command: Callable[..., None]) -> Callable[..., None]:
     """Attach the ClickHouse (clickhouse-download skill) options to a command."""
     options = [
@@ -445,8 +503,9 @@ def _coverage_report(
     ch_database: str,
     ch_script: Path | None,
     ch_python: str | None,
+    feed: feeds.Feed = feeds.EXECUTIONS,
 ) -> coverage.CoverageReport:
-    """Run the tenant coverage query and print its table.
+    """Run the tenant coverage query for one feed and print its table.
 
     Raises:
         click.ClickException: If the skill is missing or the query fails.
@@ -454,12 +513,20 @@ def _coverage_report(
     try:
         settings = coverage.resolve_settings(ch_script, ch_python, ch_env, ch_database)
         click.echo(f"Checking what {tenant} already holds for {start} .. {end_exclusive} "
-                   f"(ClickHouse {ch_env}/{ch_database})...")
-        report = coverage.check_coverage(tenant, start, end_exclusive, settings)
+                   f"({feed.name}; ClickHouse {ch_env}/{ch_database})...")
+        report = coverage.check_coverage(tenant, start, end_exclusive, settings, feed=feed)
     except coverage.CoverageError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(coverage.format_report(report))
     return report
+
+
+_feed_option = click.option(
+    "--feed", "feed_name", type=click.Choice(sorted(feeds.FEEDS), case_sensitive=False),
+    default=feeds.EXECUTIONS.name, show_default=True,
+    help="Which HALO feed: executions (LINKED_PRIVATE_EXECUTION_V2 parts, event_type EXECUTION) "
+         "or orders (PRIVATE_ORDER_V2 parts, event_type ORDER).",
+)
 
 
 @cli.command("check-coverage")
@@ -468,11 +535,13 @@ def _coverage_report(
 @click.option("--end", "end_str", required=True, metavar="YYYY-MM-DD",
               help="Exclusive end transact date (UTC). Must be > --start.")
 @click.option("--tenant", required=True, help="HALO tenant, e.g. HLRESEARCH.")
+@_feed_option
 @_clickhouse_options
 def check_coverage_cmd(
     start_str: str,
     end_str: str,
     tenant: str,
+    feed_name: str,
     ch_env: str,
     ch_database: str,
     ch_script: Path | None,
@@ -485,7 +554,7 @@ def check_coverage_cmd(
     """
     start, end_exclusive = _window_dates(start_str, end_str)
     report = _coverage_report(tenant, start, end_exclusive, ch_env, ch_database, ch_script,
-                              ch_python)
+                              ch_python, feed=feeds.feed_by_name(feed_name))
     if report.covered_days:
         click.echo(f"{len(report.covered_days)} day(s) already on {tenant}; do not export them "
                    "again without a purge.", err=True)
@@ -498,15 +567,19 @@ def check_coverage_cmd(
               help="Inclusive start transact date (UTC).")
 @click.option("--end", "end_str", required=True, metavar="YYYY-MM-DD",
               help="Exclusive end transact date (UTC). Must be > --start.")
-@click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path), required=True,
-              help="Directory for the parts and the export_window.jsonl ledger.")
+@click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Directory for the parts and the export_window.jsonl ledger (default: "
+                   "output/<TENANT>/<feed>_<first day>_<last day>, so each tenant's windows "
+                   "stay in their own folder).")
 @click.option("--tenant", default=None,
               help="HALO tenant to check coverage against (required unless "
-                   "--skip-coverage-check).")
+                   "--skip-coverage-check); also picks the default --out-dir and --file-prefix.")
 @click.option("--max-file-mb", type=click.FloatRange(min=1), default=window.DEFAULT_WINDOW_PART_MB,
               show_default=True, help="Per-part cap in MB (HALO rejects files over 500 MB).")
-@click.option("--file-prefix", default=DEFAULT_FILE_PREFIX, show_default=True,
-              help="Part-name prefix (production uses the tenant name).")
+@click.option("--file-prefix", default=None,
+              help=f"Part-name prefix (default: the tenant's own, e.g. sdny for HLRESEARCH "
+                   f"and hlstrategiestest for HLSTRATEGIESTEST; {DEFAULT_FILE_PREFIX} when no "
+                   "tenant is given).")
 @click.option("--force", is_flag=True, default=False,
               help="Re-export days the ledger already marks ok.")
 @click.option("--skip-coverage-check", is_flag=True, default=False,
@@ -515,17 +588,27 @@ def check_coverage_cmd(
 @click.option("--allow-covered", "allowed_str", multiple=True, metavar="YYYY-MM-DD",
               help="Export this day even though the tenant already holds rows for it "
                    "(repeatable; use after reading the coverage table).")
+@_feed_option
+@click.option("--coin", "coins", multiple=True,
+              help="Limit every day to these Allium COIN values (repeatable, e.g. "
+                   "--coin xyz:CL --coin xyz:NATGAS). Omit for the whole market.")
+@click.option("--include-post-only/--exclude-post-only", default=False, show_default=True,
+              help="Orders only: keep the post-only (Alo) quoting rows, which the orders "
+                   "exporter drops by default.")
 @_clickhouse_options
 def export_window_cmd(
     start_str: str,
     end_str: str,
-    out_dir: Path,
+    out_dir: Path | None,
     tenant: str | None,
     max_file_mb: float,
-    file_prefix: str,
+    file_prefix: str | None,
     force: bool,
     skip_coverage_check: bool,
     allowed_str: tuple[str, ...],
+    feed_name: str,
+    coins: tuple[str, ...],
+    include_post_only: bool,
     ch_env: str,
     ch_database: str,
     ch_script: Path | None,
@@ -535,24 +618,30 @@ def export_window_cmd(
 
     Each day is its own query and its own part files; the outcome of every
     day is appended to export_window.jsonl in --out-dir, which upload-window
-    reads. Re-running skips days already marked ok. Exit 1 if any day
-    failed, 2 if the coverage check blocked the export.
+    reads. Re-running skips days already marked ok. --feed orders writes
+    PRIVATE_ORDER_V2 parts plus one aux_orders_DDMMYYYY.csv per day. Exit 1
+    if any day failed, 2 if the coverage check blocked the export.
     """
     start, end_exclusive = _window_dates(start_str, end_str)
     allowed = [_parse_date(value) for value in allowed_str]
+    feed = feeds.feed_by_name(feed_name)
+    tenant_obj = _tenant(tenant)
+    out_dir = _window_out_dir(out_dir, tenant_obj, feed, start, end_exclusive)
+    file_prefix = file_prefix or (tenant_obj.file_prefix if tenant_obj else DEFAULT_FILE_PREFIX)
     if skip_coverage_check:
         click.echo("WARNING: coverage check skipped; make sure none of these days is already "
                    "on the tenant.", err=True)
     else:
-        if not tenant:
+        if tenant_obj is None:
             raise click.UsageError("--tenant is required unless --skip-coverage-check is given.")
-        report = _coverage_report(tenant, start, end_exclusive, ch_env, ch_database, ch_script,
-                                  ch_python)
+        report = _coverage_report(tenant_obj.name, start, end_exclusive, ch_env, ch_database,
+                                  ch_script, ch_python, feed=feed)
         blocked = report.blocked_days(allowed)
         if blocked:
             click.echo(
                 f"Refusing to export {', '.join(d.isoformat() for d in blocked)}: already on "
-                f"{tenant}. Pass --allow-covered <date> per day after checking the source files "
+                f"{tenant_obj.name}. Pass --allow-covered <date> per day after checking the "
+                "source files "
                 "above, or ask Solidus for a purge first.",
                 err=True,
             )
@@ -566,10 +655,14 @@ def export_window_cmd(
             click.echo(f"{record.day}: {record.status.upper()} ({record.seconds / 60:.1f} min)\n"
                        f"{record.error}", err=True)
 
-    click.echo(f"Exporting {start} .. {end_exclusive} day by day -> {out_dir} "
-               f"({max_file_mb:g} MB parts, prefix {file_prefix})")
+    click.echo(f"Exporting {feed.name} {start} .. {end_exclusive} day by day -> {out_dir} "
+               f"({max_file_mb:g} MB parts, prefix {file_prefix}, "
+               f"coins {', '.join(coins) or 'ALL'}"
+               f"{', post-only included' if feed is feeds.ORDERS and include_post_only else ''})")
     result = window.export_window(start, end_exclusive, out_dir, max_part_mb=max_file_mb,
-                                  file_prefix=file_prefix, force=force, on_day=announce)
+                                  file_prefix=file_prefix, force=force, on_day=announce,
+                                  feed=feed, coins=coins or None,
+                                  include_post_only=include_post_only)
     if result.skipped:
         click.echo(f"Skipped {len(result.skipped)} day(s) already exported: "
                    f"{', '.join(d.isoformat() for d in result.skipped)}")
@@ -586,12 +679,16 @@ def export_window_cmd(
               help="Inclusive start transact date (UTC).")
 @click.option("--end", "end_str", required=True, metavar="YYYY-MM-DD",
               help="Exclusive end transact date (UTC). Must be > --start.")
-@click.option("--out-dir", type=click.Path(file_okay=False, exists=True, path_type=Path),
-              required=True, help="Directory written by export-window.")
+@click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Directory written by export-window (default: the tenant's "
+                   "output/<TENANT>/<feed>_<first day>_<last day>).")
 @click.option("--tenant", required=True,
-              help="HALO tenant (HALO_API_KEY_<TENANT> in the halo-upload skill's .env).")
-@click.option("--file-type", default=upload.DEFAULT_FILE_TYPE, show_default=True,
-              help="HALO file type; the live route ingests automatically whatever the data age.")
+              help="HALO tenant (HALO_API_KEY_<TENANT> in the halo-upload skill's .env); also "
+                   "picks the default --out-dir and names the done-file.")
+@_feed_option
+@click.option("--file-type", default=None,
+              help="HALO file type (default: the feed's; LINKED_PRIVATE_EXECUTION_V2 or "
+                   "PRIVATE_ORDER_V2). The live routes ingest automatically whatever the data age.")
 @click.option("--region", default=upload.DEFAULT_REGION, show_default=True,
               help="HALO region slug.")
 @click.option("--workers", type=click.IntRange(min=1), default=upload.DEFAULT_WORKERS,
@@ -607,6 +704,10 @@ def export_window_cmd(
               help="Wait for days the export ledger does not list yet (export still running).")
 @click.option("--dry-run", is_flag=True, default=False,
               help="List what would be sent and exit without contacting HALO.")
+@click.option("--only", "only_names", multiple=True, metavar="FILE",
+              help="Send only this part (repeatable; the exact file name). For the sample "
+                   "upload Solidus asks for on a new tenant: the part is recorded in the "
+                   "done-file like any other, so the full run later skips it.")
 @click.option("--yes", "-y", is_flag=True, default=False,
               help="Skip the tenant confirmation prompt (for unattended runs).")
 @click.option("--skill-script", type=click.Path(path_type=Path), default=None,
@@ -615,9 +716,10 @@ def export_window_cmd(
 def upload_window_cmd(
     start_str: str,
     end_str: str,
-    out_dir: Path,
+    out_dir: Path | None,
     tenant: str,
-    file_type: str,
+    feed_name: str,
+    file_type: str | None,
     region: str,
     workers: int,
     attempts: int,
@@ -625,6 +727,7 @@ def upload_window_cmd(
     poll: float,
     wait: bool,
     dry_run: bool,
+    only_names: tuple[str, ...],
     yes: bool,
     skill_script: Path | None,
 ) -> None:
@@ -632,14 +735,23 @@ def upload_window_cmd(
 
     Parts come from export_window.jsonl in --out-dir (only days marked ok).
     Every success is recorded in upload_<TENANT>.done at once, and a re-run
-    skips those names. Exit 1 if any part failed or a day was skipped.
+    skips those names. --only FILE limits the run to named parts. Exit 1 if
+    any part failed or a day was skipped.
     """
     start, end_exclusive = _window_dates(start_str, end_str)
+    feed = feeds.feed_by_name(feed_name)
+    tenant_obj = _tenant(tenant)
+    assert tenant_obj is not None  # --tenant is required
+    out_dir = _window_out_dir(out_dir, tenant_obj, feed, start, end_exclusive)
+    if not out_dir.is_dir():
+        raise click.ClickException(f"No exported window at {out_dir}; run export-window first "
+                                   "or pass --out-dir.")
     try:
         settings = upload.UploadSettings(
-            tenant=tenant.upper(), out_dir=out_dir,
+            tenant=tenant_obj.name, out_dir=out_dir,
             skill_script=upload.resolve_skill_script(skill_script),
-            file_type=file_type, region=region, workers=workers, attempts=attempts,
+            file_type=file_type or feed.file_type, region=region, workers=workers,
+            attempts=attempts,
             retry_wait_seconds=retry_wait, poll_seconds=poll,
         )
     except upload.UploadConfigError as exc:
@@ -651,7 +763,7 @@ def upload_window_cmd(
     if not dry_run and not yes:
         click.confirm(f"Upload to tenant {settings.tenant}?", abort=True)
     summary = upload.upload_window(settings, days, wait_for_export=wait, dry_run=dry_run,
-                                   on_event=click.echo)
+                                   only=only_names or None, on_event=click.echo)
     if dry_run:
         click.echo(f"Dry run: {len(summary.planned)} part(s) would be sent, "
                    f"{len(summary.already_done)} already recorded as sent.")

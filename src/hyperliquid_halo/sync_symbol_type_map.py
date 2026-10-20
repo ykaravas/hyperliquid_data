@@ -2,8 +2,11 @@
 
 The production Snowflake pipeline (repo ``defi-hyperliquid-halo``) keeps the
 per-market HALO ``SymbolType`` map as a ``VALUES`` list in
-``db/migrations/hyperliquid/R__06b_symbol_type_map.sql``. That file is the
-source of truth; this module parses it and rewrites the Python mirror so the
+``db/migrations/hyperliquid/R__06b_symbol_type_map.sql``: one block of perp
+markets keyed by the Allium ``COIN`` and, since 2026-10-13, one block of spot
+pairs keyed by the ``BASE/QUOTE`` pair name (the two key forms never collide:
+a perp key has no ``/``). That file is the source of truth; this module parses
+it, sorts the rows into one list and rewrites the Python mirror so the
 portable exporter emits the same ``SymbolType`` as production.
 
 Run it whenever the production map changes (new listings, refreshed
@@ -59,7 +62,8 @@ def parse_map_sql(sql_text: str) -> list[tuple[str, str]]:
         sql_text: Full text of ``R__06b_symbol_type_map.sql``.
 
     Returns:
-        The pairs in file order (production keeps them sorted by coin).
+        The pairs in file order (production sorts each of its two blocks,
+        perps then spot; :func:`sync` sorts the union before writing).
 
     Raises:
         SymbolTypeMapError: If no rows are found, a coin repeats, a value is
@@ -108,7 +112,8 @@ def render_module(rows: list[tuple[str, str]], source_name: str) -> str:
     """
     generated_on = datetime.now(tz=UTC).date().isoformat()
     body = "\n".join(f"    ({coin!r}, {symbol_type!r})," for coin, symbol_type in rows)
-    return f'''"""Per-market HALO ``SymbolType`` for Hyperliquid perpetual markets.
+    perps = sum(1 for coin, _ in rows if "/" not in coin)
+    return f'''"""Per-market HALO ``SymbolType`` for Hyperliquid markets, perps and spot.
 
 GENERATED FILE. Do not edit by hand; regenerate with::
 
@@ -116,20 +121,27 @@ GENERATED FILE. Do not edit by hand; regenerate with::
 
 Mirror of the production map in ``defi-hyperliquid-halo``
 (``db/migrations/hyperliquid/{source_name}``), which is itself generated from
-the ``hyperliquid_perps_universe.xlsx`` workbook's curated SymbolType column.
-Keyed by the Allium ``COIN`` value: a bare ticker on the main dex (``BTC``)
-or ``<dex>:<TICKER>`` on HIP-3 dexes (``xyz:TSLA``). Delisted markets are
-included on purpose so historical trades still map on backfill.
+the curated SymbolType columns of the ``hyperliquid_perps_universe.xlsx`` and
+``hyperliquid_spot_universe.xlsx`` workbooks. Keys:
 
-How the exporters consume it (same policy as production):
+* perps: the Allium ``COIN`` value, a bare ticker on the main dex (``BTC``)
+  or ``<dex>:<TICKER>`` on HIP-3 dexes (``xyz:TSLA``);
+* spot: the ``BASE/QUOTE`` pair name (``HYPE/USDC``, ``XAUT0/USDT0``), which
+  both exporters build from Allium's token symbols (Allium's ``COIN`` for a
+  spot pair is ``@<index>``). A perp key never contains ``/``.
 
-* spot rows always emit ``Crypto`` (Hyperliquid spot is crypto-only; the map
-  is not consulted);
-* perp rows emit the mapped value, and nothing else: a perp missing from
-  this map ships with ``SymbolType`` empty (the field is optional in HALO)
-  until the map is regenerated. No guessed fallback.
+Delisted perps are included on purpose so historical trades still map on
+backfill; spot pairs are never delisted.
 
-Generated {generated_on} from {source_name} ({len(rows)} markets).
+How the exporters consume it (same policy as production since 2026-10-13):
+every row emits the mapped value, and nothing else. A market missing from
+this map, perp or spot, ships with ``SymbolType`` empty (the field is optional
+in HALO) until the map is regenerated. No guessed fallback. Spot rows were
+``Crypto`` unconditionally before; most spot pairs are memecoins, tokenized
+stocks, stablecoins, gold or FX, so that constant was wrong for them.
+
+Generated {generated_on} from {source_name} ({len(rows)} markets: {perps} perps,
+{len(rows) - perps} spot pairs).
 """
 
 from __future__ import annotations
@@ -173,7 +185,7 @@ def sync(source: Path, output: Path = _DEFAULT_OUTPUT) -> int:
     """
     if not source.is_file():
         raise FileNotFoundError(f"production map not found: {source}")
-    rows = parse_map_sql(source.read_text(encoding="utf-8"))
+    rows = sorted(parse_map_sql(source.read_text(encoding="utf-8")))
     output.write_text(render_module(rows, source.name), encoding="utf-8")
     logger.info("Wrote %d markets from %s to %s", len(rows), source, output)
     return len(rows)

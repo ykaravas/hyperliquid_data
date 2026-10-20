@@ -30,7 +30,9 @@ rationale, including the §8 decisions log that drives:
   the lookback keeps the ``{COIN}/USDC`` placeholder.
 * ``Blockchain`` is ``ethereum`` (HALO's enum has no Hyperliquid value)
   and ``SymbolType`` comes from the same seeded per-market map as the
-  executions feed, so both feeds describe an instrument identically.
+  executions feed (perps by ``COIN``, spot by the resolved ``BASE/QUOTE``
+  pair name, since 2026-10-20 as in production's orders pipeline), so both
+  feeds describe an instrument identically.
 * ``Id`` is ``ORDER_ID`` plus the side suffix production puts on execution
   ``OrderID`` (``-B`` for buys, ``-S`` for sells), so an execution shipped
   under ``--halo-strict`` links to its order inside HALO (2026-09-28).
@@ -72,10 +74,12 @@ rationale, including the §8 decisions log that drives:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
+from .filters import coin_filter
 from .symbol_type_map import render_values_rows
 
 HALO_ORDER_COLUMNS: tuple[str, ...] = (
@@ -161,10 +165,10 @@ class OrdersQueryParams:
         start_ts: Inclusive lower bound on ``ORDER_TIMESTAMP``. Naive
             datetimes are treated as UTC.
         end_ts: Exclusive upper bound on ``ORDER_TIMESTAMP``.
-        coin: Optional Allium ``COIN`` filter. Plain perpetual names
-            (``BTC``), k-prefix (``kPEPE``), HIP-3 (``xyz:SP500``), spot
-            indices (``@107``), and legacy spot pairs (``PURR/USDC``) are
-            all valid values for this field.
+        coin: Optional Allium ``COIN`` filter: one market or a sequence of
+            markets. Plain perpetual names (``BTC``), k-prefix (``kPEPE``),
+            HIP-3 (``xyz:SP500``), spot indices (``@107``), and legacy spot
+            pairs (``PURR/USDC``) are all valid values.
         market_type: Optional ``'spot'`` / ``'perpetuals'`` filter.
             ``RAW.ORDERS`` has no ``MARKET_TYPE`` column, so the filter
             is inferred from ``COIN`` shape: ``@N``-prefixed or
@@ -197,18 +201,18 @@ class OrdersQueryParams:
             1,546,618,738 exportable events (98%), almost all from about
             100 market-making accounts; without them the day is 31,261,154
             rows. Armed trigger rows (NULL TIF) and every Gtc, Ioc and market
-            order are kept. Default ``False`` (everything).
+            order are kept. Default ``True`` since 2026-09-29 (§8.1 #20).
     """
 
     start_ts: datetime
     end_ts: datetime
-    coin: str | None = None
+    coin: str | Sequence[str] | None = None
     market_type: str | None = None
     user: str | None = None
     spot_lookback_days: int = 30
     trigger_lookback_days: int = 14
     position_lookback_days: int = 30
-    exclude_post_only: bool = False
+    exclude_post_only: bool = True
 
     def __post_init__(self) -> None:
         if self.market_type is not None and self.market_type not in ("spot", "perpetuals"):
@@ -277,9 +281,10 @@ def build_orders_query(params: OrdersQueryParams) -> tuple[str, dict[str, Any]]:
     }
 
     filters: list[str] = []
-    if params.coin is not None:
-        filters.append("AND COIN = %(coin)s")
-        binds["coin"] = params.coin
+    coin_predicate, coin_binds = coin_filter(params.coin)
+    if coin_predicate is not None:
+        filters.append(coin_predicate)
+        binds.update(coin_binds)
     if params.market_type == "spot":
         filters.append("AND (COIN LIKE '@%%' OR COIN LIKE '%%/%%')")
     elif params.market_type == "perpetuals":
@@ -456,11 +461,13 @@ _CONTINGENCY_EXPR = """CASE WHEN tp.pair_user IS NOT NULL
             THEN 'OCO'
         END"""
 
-# SymbolType: spot is crypto-only on Hyperliquid, so spot rows are always
-# 'Crypto'. Perps take the seeded per-market value keyed on COIN (BTC,
-# xyz:TSLA) and nothing else: an unmapped perp emits NULL, never a guess.
-# Same policy as the executions feed and production.
-_SYMBOL_TYPE_EXPR = f"""CASE WHEN {_IS_SPOT_EXPR} THEN 'Crypto' ELSE m.symbol_type END"""
+# SymbolType: the seeded per-market value, perps and spot alike, and nothing
+# else: an unmapped market emits NULL, never a guess. The map is joined by
+# COIN for perps (BTC, xyz:TSLA) and by the pair name spot_pairs resolved for
+# an '@N' spot order ('PURR/USDC' is the one spot COIN that is already a
+# name). Same policy as the executions feed and production (R__04 of the
+# orders pipeline; spot was 'Crypto' unconditionally until 2026-10-13).
+_SYMBOL_TYPE_EXPR = "m.symbol_type"
 
 # TransactTime: original placement for `open`; status-change time otherwise.
 _TRANSACT_TIME_EXPR = """CASE WHEN STATUS = 'open'
@@ -725,7 +732,8 @@ SELECT
 FROM filtered o
 LEFT JOIN armed_orders ao ON ao.armed_order_id = o.ORDER_ID
 LEFT JOIN position_sizes ps ON ps.ps_order_id = o.ORDER_ID
-LEFT JOIN symbol_type_map m ON m.map_coin = o.COIN
+LEFT JOIN symbol_type_map m
+       ON m.map_coin = IFF(o.COIN LIKE '@%%', sp.token_a || '/' || sp.token_b, o.COIN)
 LEFT JOIN spot_pairs sp ON sp.spot_coin = o.COIN
 LEFT JOIN tpsl_pairs tp
        ON tp.pair_user = o."USER"

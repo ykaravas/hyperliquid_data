@@ -12,7 +12,8 @@ to the same bar as a batch production ships:
 * **DQ-6** ``PositionEffect`` is NULL only on SPOT rows or position flips.
 * **DQ-7** every direction is in the known-eligible set (gate leak guard).
 * **DQ-8** HIP-3 symbols match ``-[A-Z]+/`` and both sides agree on ``Symbol``.
-* **DQ-9** (WARN) SWAP rows with an empty ``SymbolType``: the map is stale.
+* **DQ-9** (WARN) rows with an empty ``SymbolType``, perp or spot: the map is
+  stale (spot joined the map on 2026-10-20; before that only SWAP rows counted).
 
 Production runs these as SQL over the pending batch. Here they run in one
 pass over the rows as the exporter streams them, with O(1) memory: the
@@ -223,7 +224,7 @@ class ExecutionDqChecker:
         group.symbols.add("" if _is_null(symbol) else str(symbol))
         group.security_type = security_type
         group.symbol = None if _is_null(symbol) else str(symbol)
-        if security_type == "SWAP" and _is_null(halo_row.get("SymbolType")):
+        if _is_null(halo_row.get("SymbolType")):
             group.symbol_type_null = True
 
         # DQ-3: required fields non-NULL.
@@ -273,8 +274,8 @@ class ExecutionDqChecker:
         # DQ-8 (symmetry half): both sides agree on Symbol.
         if len(group.symbols) > 1:
             self._dq8_symmetry_violations += 1
-        # DQ-9: unmapped perp symbol, counted per symbol.
-        if group.symbol_type_null and group.security_type == "SWAP":
+        # DQ-9: unmapped market (perp or spot), counted per symbol.
+        if group.symbol_type_null:
             symbol = group.symbol or ""
             self._dq9_rows[symbol] = self._dq9_rows.get(symbol, 0) + len(group.sides)
             self._dq9_trades[symbol] = self._dq9_trades.get(symbol, 0) + 1
@@ -340,7 +341,7 @@ class ExecutionDqChecker:
         return DqReport(results=tuple(results))
 
     def _dq9(self) -> DqResult:
-        """WARN-level: SWAP rows shipping with an empty SymbolType (stale map)."""
+        """WARN-level: rows shipping with an empty SymbolType, perp or spot (stale map)."""
         rows = sum(self._dq9_rows.values())
         trades = sum(self._dq9_trades.values())
         symbols = len(self._dq9_rows)
@@ -349,12 +350,12 @@ class ExecutionDqChecker:
             "rows": rows, "trades": trades, "symbols": symbols,
             "top_symbols": [{"symbol": s, "rows": n} for s, n in top],
         }
-        description = "no SWAP rows with empty SymbolType (symbol-type map up to date)"
+        description = "no rows with empty SymbolType (symbol-type map up to date)"
         if rows == 0:
             return DqResult("DQ-9", description, "PASS", observed)
         more = symbols - len(top)
         summary = (
-            f"SymbolType empty on {rows} SWAP rows ({trades} trades, {symbols} symbols): "
+            f"SymbolType empty on {rows} rows ({trades} trades, {symbols} symbols): "
             + ", ".join(f"{s} {n}" for s, n in top)
             + (f", +{more} more" if more > 0 else "")
             + ". Regenerate symbol_type_map.py from production's R__06b "

@@ -133,7 +133,7 @@ See §5.3.
 
 | `TIME_IN_FORCE`     | Share  | HALO `TimeInForce`  | HALO `TrdType` | Notes |
 |---------------------|--------|---------------------|----------------|-------|
-| `Alo`               | 97.4 % | `GoodTillCancel`    | `PostOnly`     | **ALO = Add Liquidity Only**, Hyperliquid's name for post-only. The order rests passively on the book; if it would immediately cross the spread on placement, it is rejected with `badAloPxRejected` instead of executing as a taker. HALO has no ALO enum, so the post-only intent is carried by `TrdType`. |
+| `Alo`               | 97.4 % | `GoodTillCancel`    | `PostOnly`     | **ALO = Add Liquidity Only**, Hyperliquid's name for post-only. The order rests passively on the book; if it would immediately cross the spread on placement, it is rejected with `badAloPxRejected` instead of executing as a taker. An accepted `Alo` order has no expiry: it rests until it is filled or canceled, which is `GoodTillCancel`. HALO has no ALO enum, so the post-only intent is carried by `TrdType` (not by `GoodTillCross`; see §8.2 #9). These rows are left out of the export by default (see the scale note in §4.4). |
 | `Ioc`               | 1.9 %  | `ImmediateOrCancel` | `RegularTrade` | |
 | `Gtc`               | 0.6 %  | `GoodTillCancel`    | `RegularTrade` | |
 | `FrontendMarket`    | 0.022 %| `ImmediateOrCancel` | `RegularTrade` | UI-spawned market order with frontend-bounded slippage. |
@@ -161,19 +161,22 @@ Volume-wise, `badAloPxRejected` dominates (≈59 % of all order events):
 post-only orders that would have crossed the spread are rejected
 immediately. Surveillance models should weight this accordingly.
 
-**Scale, and the `--exclude-post-only` option.** A full day is far
-larger than the executions feed: 2026-03-02 has 1,546,618,738 exportable
-order events (the executions day of 2026-04-20 had 8,660,378 rows).
-1,515,357,584 of them (98%) are `Alo`, and the 100 busiest accounts
+**Scale, and why post-only rows are left out by default.** A full day is
+far larger than the executions feed: 2026-03-02 has 1,546,618,738
+exportable order events (the executions day of 2026-04-20 had 8,660,378
+rows). 1,515,357,584 of them (98%) are `Alo`, and the 100 busiest accounts
 produce 74% of all rows; 829 M are rejects, 361 M `open`, 356 M cancels,
 66,685 `triggered`. As CSV that day is about 1 TB and roughly 1,200 HALO
-parts. `export-orders --exclude-post-only` (2026-09-29) drops the `Alo`
-rows at source (`TIME_IN_FORCE IS NULL OR TIME_IN_FORCE <> 'Alo'`, so the
-NULL-TIF armed trigger rows stay) and leaves 31,261,154 rows: 17.1 M
-`Ioc`, 13.2 M `Gtc`, 731,524 armed trigger rows, 273,830 `FrontendMarket`.
-Whether HALO should receive the quoting traffic at all is a question for
-Solidus (§8.2 #12); until then the option is how a whole day gets
-exported.
+parts. `export-orders` therefore drops the `Alo` rows at source by
+default (`--exclude-post-only`, the default since 2026-09-29;
+`TIME_IN_FORCE IS NULL OR TIME_IN_FORCE <> 'Alo'`, so the NULL-TIF armed
+trigger rows stay) and leaves 31,261,154 rows: 17.1 M `Ioc`, 13.2 M `Gtc`,
+731,524 armed trigger rows, 273,830 `FrontendMarket`.
+`--include-post-only` exports the quoting traffic too, mapped per §4.3.
+The cost of the default: the file is not a full order book history,
+because most resting orders of market makers (and any passive layering
+placed as post-only) are missing. Whether HALO should receive the quoting
+traffic at all is still a question for Solidus (§8.2 #12).
 
 ## 5. Special cases / gotchas
 
@@ -482,7 +485,7 @@ market data stays worthwhile regardless (§8.2 #13).
 | `ExchangeSymbol`     | `Hyperliquid:{PAIR}` for resolved spot, else `Hyperliquid:{COIN}` (§3, §5.1) | Matches the executions feed's `Hyperliquid:{PAIR}`. |
 | `ContractMultiplier` | per §3                                          | |
 | `Blockchain`         | literal `'ethereum'`                            | HALO's supported Blockchain list has no Hyperliquid value; `ethereum` is the closest valid one (HL accounts are EVM addresses) and matches the executions feed. Changed 2026-09-21 (was `'hyperliquid'`, an invalid enum value). |
-| `SymbolType`         | `'Crypto'` for spot; per-market map value for perps (keyed on `COIN`, e.g. `BTC`, `xyz:TSLA`); `NULL` when unmapped | Same seeded map as the executions feed (`symbol_type_map.py`, mirrored from production `R__06b`). No guessed fallback. |
+| `SymbolType`         | Per-market map value for perps (keyed on `COIN`, e.g. `BTC`, `xyz:TSLA`) and for spot (keyed on the pair name `spot_pairs` resolved for the `@N` index, e.g. `HYPE/USDC`); `NULL` when unmapped | Same seeded map as the executions feed (`symbol_type_map.py`, mirrored from production `R__06b`), same join as production's orders pipeline (`IFF(COIN LIKE '@%', token_a || '/' || token_b, COIN)`). Spot was `'Crypto'` until 2026-10-20. No guessed fallback. |
 | `WalletAddress`      | `USER`                                          | |
 | `Text`               | `STATUS` (raw)                                  | The specific Hyperliquid reject / cancel reason (`badAloPxRejected`, `siblingFilledCanceled`, ...) that the `Status` collapse discards, visible inside HALO rather than only in aux. camelCase letters, within HALO's charset and 2048-char cap. Added 2026-09-28. |
 | `Notional`           | `OrderQty × LIMIT_PRICE` in `NUMBER(38,12)` (the position size on sized full-position rows), trailing zeros trimmed | USD value of the order; every Hyperliquid quote token is dollar-pegged. Sent on every row, including `Market` / `StopLoss` rows whose `Price` is withheld, because without it HALO resolves the quote token against its market data and refuses USDE-quoted instruments (§5.10). Added 2026-09-29 (was `NULL`). |
@@ -528,14 +531,14 @@ self-containment, plus the work deferred to later passes.
 |---|----------|-----------|
 | 1 | **`filled` order rows are filtered out** of the orders feed. | Fills are already covered by the trades pipeline (`DEX.TRADES` → HALO executions). HALO order `Status` does not accept `Filled` regardless. |
 | 2 | **`triggered` → HALO `Replaced`.** | Closest semantic to "the conditional order has been swapped for a live limit." Alternative was `Restate`. |
-| 3 | **ALO → `TimeInForce=GoodTillCancel` + `TrdType=PostOnly`.** | HALO has no ALO enum; post-only intent is carried by `TrdType`. |
+| 3 | **ALO → `TimeInForce=GoodTillCancel` + `TrdType=PostOnly`** (reconfirmed 2026-09-29 over `GoodTillCross`). | HALO has no ALO enum; post-only intent is carried by `TrdType`. An `Alo` order has no expiry, so `GoodTillCancel` describes how long it lives. See §8.2 #9 for the evidence. |
 | 4 | **`Stop Market` and `Take Profit Market` both map to `StopLoss`** (and the Limit variants to `LimitToStop`). | HALO has no separate take-profit enum. Direction is implicit in `StopPx` vs. mid. The raw HL `TYPE` is preserved in aux `_RawType`. |
 | 5 | **`Vault Close` rows are dropped at source.** | Vaults are not in surveillance scope today, and a forced unwind is not a meaningful "order" from a TS-algo perspective. See 8.2#1. |
 | 6 | **HIP-3 `{dex}:{market}` emits `{market}-{DEX}/{quote}`** (e.g. `SP500-XYZ/USDC`), superseding the earlier verbatim `xyz:SP500/USDC` form (2026-09-21). | Same symbology as the executions feed and production, so orders and executions of one contract share a `Symbol`; the dex stays in the name because HIP-3 market names are not unique across builder dexes. See §5.4. |
 | 7 | **`@N` spot pairs are resolved to `TOKEN_A/TOKEN_B` through a `DEX.TRADES` lookback join** (2026-09-21; superseding the `{COIN}/USDC` placeholder, which now only remains for pairs with no naming trade in the window). | Uses Allium's own token strings, so orders and executions share `Symbol` and `ExchangeSymbol` per pair. See §5.1. |
 | 8 | **TP/SL brackets stay inline** — one HALO row per parent with `ContingencyType=OCO`. | Preserves row counts. The raw children JSON is kept in aux `_Children` so per-leg details are still recoverable downstream. |
 | 9 | **`Blockchain = 'ethereum'`** (2026-09-21; was `'hyperliquid'`). | HALO's Blockchain enum has no Hyperliquid value; `ethereum` is the value the executions feed and production emit. |
-| 10 | **`SymbolType` emitted from the shared per-market map** (2026-09-21). | Optional HALO enum; using the same map as executions keeps both feeds describing an instrument identically. Unmapped perps stay empty. |
+| 10 | **`SymbolType` emitted from the shared per-market map** (2026-09-21; spot keyed by pair name instead of a constant `Crypto` since 2026-10-20, following production's 2026-10-13 change). | Optional HALO enum; using the same map as executions keeps both feeds describing an instrument identically. Unmapped markets stay empty. |
 | 11 | **`Id` carries the `-B` / `-S` side suffix** (2026-09-28; was the bare `oid`). | Production's executions ship `OrderID` as `oid-B` / `oid-S` and HALO links an execution to its order through that field, so the orders feed must use the same form. The executions feed is unchanged. See §6. |
 | 12 | **`#N` HIP-4 outcome-market rows are dropped at source** (2026-09-28). | Out of scope; absent from Allium's `DEX.TRADES` enrichment; would otherwise ship as a mislabeled perp. See §5.7. |
 | 13 | **Rows sharing `Id` and `TransactTime` are ordered New, Replaced, then terminal** (2026-09-28). | Block-granular timestamps put 7% of rows on the same millisecond as another row of the same order; without the rank HALO could see `Canceled` before `New`. See §2. |
@@ -545,7 +548,7 @@ self-containment, plus the work deferred to later passes.
 | 17 | **`StopPx`, `OrigTransactTime` and the OCO keys of fired trigger orders come from the `armed_orders` lookback** (2026-09-28). | Post-trigger rows are re-stamped to the trigger time with `TRIGGER_PRICE = 0`, and their armed rows may sit days earlier, outside the day window. A trigger type with no armed row inside the lookback degrades to `Market` / `Limit`. See §5.9. |
 | 18 | **`OCO` from sibling pairing, not `IS_TAKE_PROFIT_OR_STOP_LOSS`** (2026-09-28). | The flag is `isPositionTpsl`; it missed 53% of proven pairs and marked standalone stops. Pairing on user, coin, side and `ORDER_TIMESTAMP` finds 90%. See §5.2. |
 | 19 | **Size-0 (full-position TP/SL) rows are kept, counted, and only withheld on request** (2026-09-28). | They hold the fired-stop events; whether HALO accepts `OrderQty = 0` is untested. `--drop-zero-qty` is the fallback, never a silent filter. See §5.8. |
-| 20 | **`--exclude-post-only` drops `Alo` rows on request** (2026-09-29; first used for the 2026-03-02 day export). | 98% of a day's events are post-only quoting from about 100 accounts, about 1 TB of CSV per day; the remaining 31 M rows carry every taker, resting and trigger order. Off by default. See §4.3. |
+| 20 | **Post-only (`Alo`) rows are dropped by default; `--include-post-only` brings them back** (2026-09-29; the option was added the same day as opt-in and first used for the 2026-03-02 day export, then made the default). | 98% of a day's events are post-only quoting from about 100 accounts, about 1 TB of CSV per day; the remaining 31 M rows carry every taker order, every `Gtc` resting order and every trigger order. The default holds for now, until Solidus answers §8.2 #12. See §4.4. |
 | 22 | **Full-position TP/SL rows are sized from the trader's position at placement** (2026-09-29). | HALO rejects `OrderQty = 0`; the orders table recovers only the 18% that fire; Allium's per-side start positions on fills give the position at placement for 99.5% of them. The rest are withheld and counted. See §5.8. |
 | 21 | **`Notional = OrderQty × LIMIT_PRICE` on every row** (2026-09-29; was `NULL`). | HALO refused every USDE-quoted order row on SDNYTEST for lack of market data on USDE; executions with the same symbols load because they carry `Notional`. All four quote tokens are dollar-pegged, so the product is USD to within the peg. To be confirmed on a small SDNYTEST file. See §5.10. |
 
@@ -589,11 +592,67 @@ self-containment, plus the work deferred to later passes.
    snapshot at placement and the fired rows carry the real size, so
    `OrderQty` can change across an order's versions. Tenant for orders:
    `HLRESEARCH` (decided 2026-09-29); nothing uploaded there yet.
-9. **`Alo` as `GoodTillCross`.** HALO v2.1 lists `GoodTillCross` (the
-   FIX post-only TIF) in the `TimeInForce` enum, but the onboarding notes
-   list only five values. Both feeds send `GoodTillCancel` plus
-   `TrdType = PostOnly` until Solidus confirms which field their algos
-   read; flip both feeds together, or neither.
+9. **`Alo` as `GoodTillCross`.** Settled 2026-09-29: stay with
+   `GoodTillCancel` plus `TrdType = PostOnly` (decision 3). No written
+   answer from Solidus was found in the HALO integration and schema
+   notes or the batch upload instructions. Solidus's Slack and email
+   were not searched (no access from this repo's tooling), so this rests
+   on the evidence below and not on a confirmation of which field the
+   algos read:
+   - HALO's own description of `TrdType` names `PostOnly` as the value
+     "used by traders such as market makers for orders that will rest on
+     the orderbook". That is exactly what `Alo` is.
+   - `GoodTillCross` is in the v2.1 `TimeInForce` enum without any
+     description, and the onboarding notes list only the other five
+     values.
+   - In FIX, `TimeInForce` 5 "Good Till Crossing" (GTX) is "an order to
+     buy or sell that is canceled prior to the market entering into an
+     auction or crossing phase", and Solidus's trade surveillance course
+     material describes it the same way. Hyperliquid trades
+     continuously and has no auction or crossing phase, so the value
+     would be wrong in its original meaning. FIX `TimeInForce` 1 "Good
+     Till Cancel" is an order that "remains in effect until it is either
+     executed or canceled", which is what an accepted `Alo` order does.
+   - FIX carries post-only outside of `TimeInForce`, as an execution
+     instruction (`ExecInst`, tag 18). Deribit sends post-only as
+     `ExecInst = 6` ("Participate don't initiate") and Coinbase as
+     `ExecInst = A` ("Add Liquidity Only (Post Only)"), each with its
+     own separate `TimeInForce`. HALO's `TimeInForce` + `TrdType` pair
+     has the same shape.
+   - Binance is the exception: its `timeInForce` list has "GTX - Good
+     Till Crossing (Post Only)". That naming is the likely reason the
+     value is in HALO's enum at all (an inference, not something Solidus
+     has said).
+   - Hyperliquid's own docs define Post Only (ALO) as "an order that is
+     added to the order book but doesn't execute immediately. It is only
+     executed as a resting order", and GTC as "an order that rests on
+     the order book until it is filled or canceled". The API docs say
+     `Alo` "will be canceled instead of immediately matching" and that
+     `Gtc` orders "have no special behavior". Allium's data guide says
+     `Alo` "works similarly to 'Post Only' on other exchanges". None of
+     them gives an order an expiry (`expiresAfter` in the API is a
+     deadline on the request, not on a resting order).
+   - The data agrees (measured 2026-09-29 on `RAW.ORDERS`). Of the
+     226,776 `Alo` orders accepted between 12:00 and 12:01 UTC on
+     2026-03-02, every one ended as `filled` or with a cancel status,
+     never an expiry. Of the 9.71 M fill or cancel events of `Alo`
+     orders placed between 12:00 and 13:00 that day, 12 came more than a
+     day after placement and 6 more than a week after (longest 24.4
+     days), and 7 of the 12 were fills. So an `Alo` order survives
+     midnight and rests until it is filled or canceled; most are simply
+     canceled by their owner within seconds (median 1.1 s in the
+     one-minute sample).
+   - The production orders mapping in `defi-hyperliquid-halo` sends the
+     same pair of values.
+
+   Sources: Hyperliquid docs (Trading, Order types; For developers,
+   Exchange endpoint), Allium's Hyperliquid data guide, the FIX 5.0 SP2
+   dictionary (tags 59 and 18), Binance derivatives "Common Definition",
+   Coinbase Exchange FIX order entry messages, Deribit FIX New Order
+   Single.
+
+   Reopen only if Solidus states that an algo reads `GoodTillCross`; then
+   change this repo and production together.
 11. **Trigger lookback.** `--trigger-lookback-days` defaults to 14, which
     covers 98.3% of fired trigger orders (§5.9); 30 days covers 98.7%.
     Measure how many post-trigger rows still degrade to `Market` / `Limit`
@@ -606,8 +665,9 @@ self-containment, plus the work deferred to later passes.
 12. **Quoting traffic in HALO.** Ask Solidus whether an orders feed of
     1.5 billion events a day (98% post-only quoting, mostly rejected) is
     something HALO should ingest, or whether the 31 M non-post-only rows
-    (§4.3) are the intended feed. The answer decides whether
-    `--exclude-post-only` becomes the default.
+    (§4.4) are the intended feed. Leaving the quoting out is the default
+    for now (decision 20, 2026-09-29); the answer decides whether it
+    stays the default.
 10. **Production port.** When this feed moves into `defi-hyperliquid-halo`,
    it should be its own pipeline (own view, DQ procedure, upload procedure
    with HALO file type `PRIVATE_ORDER_V2`, ledger keyed on

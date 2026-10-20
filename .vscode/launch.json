@@ -265,6 +265,119 @@
             "python": "${workspaceFolder}/.venv/bin/python",
             "envFile": "${workspaceFolder}/.env",
             "justMyCode": true
+        },
+        {
+            "name": "Export window: orders, three xyz markets, post-only included (one day)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "export-window",
+                "--feed",
+                "orders",
+                "--start",
+                "2026-03-01",
+                "--end",
+                "2026-03-02",
+                "--tenant",
+                "HLRESEARCH",
+                "--coin",
+                "xyz:CL",
+                "--coin",
+                "xyz:BRENTOIL",
+                "--coin",
+                "xyz:NATGAS",
+                "--include-post-only",
+                "--out-dir",
+                "${workspaceFolder}/output/xyz_commodities_20260301_20260309/orders"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Upload window: orders to HLRESEARCH, dry run (one day)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "args": [
+                "upload-window",
+                "--feed",
+                "orders",
+                "--start",
+                "2026-03-01",
+                "--end",
+                "2026-03-02",
+                "--tenant",
+                "HLRESEARCH",
+                "--dry-run",
+                "--out-dir",
+                "${workspaceFolder}/output/xyz_commodities_20260301_20260309/orders"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Check coverage: HLSTRATEGIESTEST Oct 10 to 19 2026",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true,
+            "args": [
+                "check-coverage",
+                "--start",
+                "2026-10-10",
+                "--end",
+                "2026-10-20",
+                "--tenant",
+                "HLSTRATEGIESTEST"
+            ]
+        },
+        {
+            "name": "Export window: HLSTRATEGIESTEST Oct 10 to 19 2026 (tenant folder and prefix)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true,
+            "args": [
+                "export-window",
+                "--start",
+                "2026-10-10",
+                "--end",
+                "2026-10-20",
+                "--tenant",
+                "HLSTRATEGIESTEST"
+            ]
+        },
+        {
+            "name": "Upload window: HLSTRATEGIESTEST Oct 10 to 19 2026, dry run",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "hyperliquid_halo.cli",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "envFile": "${workspaceFolder}/.env",
+            "justMyCode": true,
+            "args": [
+                "upload-window",
+                "--start",
+                "2026-10-10",
+                "--end",
+                "2026-10-20",
+                "--tenant",
+                "HLSTRATEGIESTEST",
+                "--dry-run"
+            ]
         }
     ]
 }

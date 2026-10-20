@@ -25,9 +25,12 @@ Market handling:
     * ``PositionEffect`` and ``ContractMultiplier`` are emitted only for
       perpetuals; they are NULL for spot (PositionEffect is not applicable and
       HALO's ContractMultiplier requirement is SWAP/FUT/OPT/CFD-only).
-    * ``SymbolType`` is ``Crypto`` for spot and the seeded per-market value
-      (:mod:`hyperliquid_halo.symbol_type_map`) for perps; a perp missing
-      from the map emits NULL rather than a guess.
+    * ``SymbolType`` is the seeded per-market value
+      (:mod:`hyperliquid_halo.symbol_type_map`) for perps and spot alike:
+      the map is keyed by the Allium ``COIN`` for perps and by the
+      ``BASE/QUOTE`` pair name for spot (production R__07 since 2026-10-13;
+      spot was ``Crypto`` unconditionally before). A market missing from the
+      map emits NULL rather than a guess.
 
 Eligibility:
     By default the query applies production's eligibility gate (unresolved
@@ -40,10 +43,12 @@ See ``docs/FUNCTIONAL_SPEC.md`` for the full field-by-field rationale.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from typing import Any
 
+from .filters import coin_filter
 from .symbol_type_map import render_values_rows
 
 HALO_COLUMNS: tuple[str, ...] = (
@@ -137,10 +142,10 @@ class QueryParams:
         start_ts: Inclusive lower bound on ``TIMESTAMP``. Naive datetimes are
             treated as UTC.
         end_ts: Exclusive upper bound on ``TIMESTAMP``.
-        coin: Optional Allium ``COIN`` filter. For perpetuals this is the token
-            symbol (``BTC``, ``ETH``) or the dex-prefixed HIP-3 name
-            (``xyz:TSLA``); for spot it is a pair id (``@4``). When ``None``,
-            no coin filter is applied.
+        coin: Optional Allium ``COIN`` filter: one market or a sequence of
+            markets. For perpetuals this is the token symbol (``BTC``,
+            ``ETH``) or the dex-prefixed HIP-3 name (``xyz:TSLA``); for spot
+            it is a pair id (``@4``). When ``None``, no coin filter is applied.
         market_type: Optional ``'spot'`` or ``'perpetuals'`` filter. When
             ``None``, both market types are returned.
         token_a: Optional ``TOKEN_A_SYMBOL`` filter (useful for spot where the
@@ -163,7 +168,7 @@ class QueryParams:
 
     start_ts: datetime
     end_ts: datetime
-    coin: str | None = None
+    coin: str | Sequence[str] | None = None
     market_type: str | None = None
     token_a: str | None = None
     token_b: str | None = None
@@ -223,9 +228,10 @@ def build_query(params: QueryParams) -> tuple[str, dict[str, Any]]:
     }
 
     filters: list[str] = []
-    if params.coin is not None:
-        filters.append("AND COIN = %(coin)s")
-        binds["coin"] = params.coin
+    coin_predicate, coin_binds = coin_filter(params.coin)
+    if coin_predicate is not None:
+        filters.append(coin_predicate)
+        binds.update(coin_binds)
     if params.market_type is not None:
         filters.append("AND MARKET_TYPE = %(market_type)s")
         binds["market_type"] = params.market_type
@@ -446,16 +452,21 @@ base AS (
         CASE WHEN e.MARKET_TYPE = 'perpetuals' THEN 'SWAP' ELSE 'SPOT' END AS security_type_str,
         'Hyperliquid:' || COALESCE(NULLIF(e.PAIR, ''), e.COIN) AS exchange_symbol_str,
         CASE WHEN e.MARKET_TYPE = 'perpetuals' THEN '1' END AS contract_multiplier_str,
-        -- SymbolType: spot is crypto-only on Hyperliquid, so spot rows are always
-        -- 'Crypto'. Perps take the seeded per-market value and nothing else: a
-        -- perp missing from the map ships with SymbolType empty (optional in
-        -- HALO) until the map is regenerated. No guessed fallback.
-        CASE
-            WHEN e.MARKET_TYPE = 'spot' THEN 'Crypto'
-            ELSE m.symbol_type
-        END AS symbol_type_str
+        -- SymbolType: the curated per-market value from the seeded map and
+        -- NOTHING else. The map is keyed by the Allium COIN for perps and by the
+        -- BASE/QUOTE pair name for spot (Allium's COIN for a spot pair is
+        -- '@<index>', so the pair name is built from the token symbols, as
+        -- symbol_str is). A market missing from the map, perp or spot, ships
+        -- with SymbolType empty (optional in HALO) until the map is regenerated.
+        -- No guessed fallback. (Spot was 'Crypto' unconditionally until
+        -- 2026-10-13; the spot universe is mostly memecoins, tokenized stocks,
+        -- stablecoins, gold and FX, so that constant was wrong for most pairs.)
+        m.symbol_type AS symbol_type_str
     FROM eligible e
-    LEFT JOIN symbol_type_map m ON m.map_coin = e.COIN
+    LEFT JOIN symbol_type_map m
+           ON m.map_coin = IFF(e.MARKET_TYPE = 'spot',
+                               e.TOKEN_A_SYMBOL || '/' || e.TOKEN_B_SYMBOL,
+                               e.COIN)
 ),
 {buy_cte},
 {sell_cte}

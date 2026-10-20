@@ -38,14 +38,18 @@ src/hyperliquid_halo/
 ├── window.py                # per-day HALO-strict export of a window + export_window.jsonl ledger
 ├── upload.py                # resume-safe upload of an exported window (halo-upload skill)
 ├── coverage.py              # what a tenant already holds per day (ClickHouse, clickhouse-download skill)
+├── feeds.py                 # the two HALO feeds (file type, event_type, raw table) the window commands switch on
+├── tenants.py               # the HALO tenants: part prefix, output/<TENANT>/ folders, ledger document
+├── filters.py               # shared SQL filter builders (one or several COINs) for both mapping queries
 └── cli.py                   # click CLI, 7 subcommands wiring the above
 ```
 
-`symbol_type_map.py` is data, not logic: a 500-row `(coin, symbol_type)`
-tuple plus a helper that renders it as SQL `VALUES` rows. Both SQL
-templates splice those rows into a `symbol_type_map` CTE and LEFT JOIN it
-on `COIN`, so the lookup happens in Snowflake alongside the rest of the
-mapping (no Python-side post-processing of HALO values, same principle as
+`symbol_type_map.py` is data, not logic: an 880-row `(coin, symbol_type)`
+tuple (544 perps keyed by `COIN`, 336 spot pairs keyed by `BASE/QUOTE`)
+plus a helper that renders it as SQL `VALUES` rows. Both SQL templates
+splice those rows into a `symbol_type_map` CTE and LEFT JOIN it on `COIN`
+for perps and on the pair name for spot, so the lookup happens in
+Snowflake alongside the rest of the mapping (no Python-side post-processing of HALO values, same principle as
 the removed PositionEffect defaulting in §3.1).
 
 The two feeds are kept in separate modules because their grain and
@@ -208,7 +212,7 @@ Consequences per mode:
 - default: the report is logged and printed; nothing blocks. With
   `--include-ineligible`, DQ-3 (empty `Symbol` on unresolved pairs) and
   DQ-7 (liquidation directions) fail by construction.
-- DQ-9 (`SymbolType` empty on SWAP rows) warns in both modes and names
+- DQ-9 (`SymbolType` empty on any row, spot included since 2026-10-20) warns in both modes and names
   the top unmapped symbols, the cue to re-sync the map (§5.3).
 
 `ExportResult.dq_report` carries the full `DqReport` for programmatic
@@ -267,10 +271,12 @@ and the quote token is the dex's collateral as Allium reports it. There
 is no fallback for a NULL token symbol: such rows are gated out (§3.0),
 or, with the gate off, ship with an empty `Symbol` and the raw ids in aux.
 
-`SymbolType` is `Crypto` for spot and the seeded per-market value for
-perps, NULL when the market is not in the map (no guessed fallback).
-`hl_execs_halo_mapping.md` §2.3 and §2.4 have the details and the
-regeneration command.
+`SymbolType` is the seeded per-market value for perps (joined on `COIN`)
+and for spot (joined on `TOKEN_A_SYMBOL || '/' || TOKEN_B_SYMBOL`, the
+same string as `Symbol`), NULL when the market is not in the map (no
+guessed fallback). Spot was a constant `Crypto` until 2026-10-20, when
+production's 2026-10-13 change was ported. `hl_execs_halo_mapping.md` §2.3
+and §2.4 have the details and the regeneration command.
 
 ## 4. Orders feed — event-sourced grain
 
@@ -340,6 +346,20 @@ The raw `Alo` is preserved in aux `_RawTif`. ALO accounts for ~97% of
 all order events in production — surveillance models should weight
 this accordingly.
 
+`GoodTillCross` was considered and rejected (2026-09-29). An `Alo` order
+has no expiry (it rests until filled or canceled; in the data some rest
+for weeks), HALO describes `TrdType = PostOnly` as the value for orders
+that rest on the book, and "Good Till Crossing" in FIX and in Solidus's
+course material is an order canceled before an auction or crossing
+phase, which Hyperliquid does not have. FIX itself carries post-only as
+an execution instruction next to the time in force, the same shape as
+HALO's two fields; only Binance labels post-only as GTX. No Solidus
+statement on which field the algos read was found; see
+`hl_orders_halo_mapping.md` §8.2 #9 for the sources and the numbers.
+
+These rows are only in the export under `--include-post-only`; they are
+dropped by default (§4.7).
+
 ### 4.5 `Symbol` derivation across 6 `COIN` shapes
 
 `RAW.ORDERS` has no `MARKET_TYPE` / `TOKEN_A_SYMBOL` columns — `COIN`
@@ -400,12 +420,18 @@ row); the raw `CHILDREN` JSON stays in aux. See
 The `--market-type` filter on `export-orders` has no native column to
 filter on, so it's translated to a `COIN`-shape predicate:
 
+- `--coin` (repeatable on `export-orders` and `export-execs`) →
+  `AND COIN = %(coin)s` for one market, `AND COIN IN (%(coin_0)s, ...)` for
+  several, built by `filters.coin_filter`; values are always bound.
 - `--market-type spot` → `AND (COIN LIKE '@%%' OR COIN LIKE '%%/%%')`
 - `--market-type perpetuals` → `AND NOT (COIN LIKE '@%%' OR COIN LIKE '%%/%%')`
-- `--exclude-post-only` → `AND (TIME_IN_FORCE IS NULL OR TIME_IN_FORCE <> 'Alo')`
+- `--exclude-post-only` (the default since 2026-09-29;
+  `OrdersQueryParams.exclude_post_only = True`) →
+  `AND (TIME_IN_FORCE IS NULL OR TIME_IN_FORCE <> 'Alo')`
   (drops the post-only quoting that is 98% of a day's events; the NULL
   keeps armed trigger rows, which carry no TIF). Applied to the day's
   rows only, never to the `armed_orders` lookback.
+  `--include-post-only` leaves the predicate out.
 
 (The doubled `%%` is the pyformat escape from §2.2.)
 
@@ -530,11 +556,14 @@ trades are final.
 ### 5.3 SymbolType map is generated, not hand-edited
 
 The map lives in production as `R__06b_symbol_type_map.sql` (itself
-generated from the `hyperliquid_perps_universe.xlsx` workbook).
+generated from the `hyperliquid_perps_universe.xlsx` and
+`hyperliquid_spot_universe.xlsx` workbooks by the universe repo's
+`src/export_symbol_type_sql.py`, as two blocks: perps keyed by `COIN`,
+spot pairs keyed by `BASE/QUOTE`).
 `hyperliquid_halo.sync_symbol_type_map` parses that SQL, validates it
 (no duplicate coins, every value in the HALO `SymbolType` enum, no
-characters that would break a SQL literal) and rewrites
-`symbol_type_map.py`. Regenerate whenever production regenerates; the
+characters that would break a SQL literal), sorts the two blocks into one
+list and rewrites `symbol_type_map.py`. Regenerate whenever production regenerates; the
 mirror is committed so the exporter has no runtime dependency on the
 production repo. Markets missing from the map ship with an empty
 `SymbolType` in both places.
@@ -616,18 +645,55 @@ of the skill's log line that never matched, so it re-sent six parts; the
 second copy was only right because someone remembered the fix. These three
 modules make the procedure part of the package so it is the same every time.
 
+Since 2026-09-30 the procedure is the same for both feeds. `feeds.py`
+defines a `Feed` (name, HALO file type, `strict_events` event type, raw
+table) for executions (`LINKED_PRIVATE_EXECUTION_V2`, `EXECUTION`,
+`raw_realtime_matched_executions`) and orders (`PRIVATE_ORDER_V2`,
+`ORDER`, `raw_realtime_orders`); the CLI's `--feed` picks one, and every
+place below that names an executions value reads it from the feed instead.
+`export-window` also takes a repeatable `--coin` (both feeds) and
+`--include-post-only` (orders), passed through to the exporters' query
+parameters. An orders day writes its parts next to one
+`aux_orders_DDMMYYYY.csv` (no `aux/` folder), and the stale-part cleanup
+removes that file too.
+
+Since 2026-10-20 the procedure also keeps every **tenant** apart
+(`tenants.py`). A `Tenant` carries the name (the `--tenant` value, the
+`HALO_API_KEY_<TENANT>` suffix in the skill's `.env`, and the `exchange` /
+`solidus_client` value in ClickHouse) and the part-name prefix. Two are
+registered: `HLRESEARCH` with prefix `sdny` (the production pipeline's
+daily files on that tenant use it, and this repo's earlier uploads matched
+them) and `HLSTRATEGIESTEST` with prefix `hlstrategiestest` (a fresh
+tenant, so its files carry its own name as Solidus's
+`<org>_<fileType>_<DDMMYYYY>_part<N>.csv` rule intends). An unregistered
+name still works with generic defaults (prefix = name in lower case). From
+the tenant the CLI derives, whenever the flag is absent:
+
+| Flag | Default from the tenant | Example |
+|---|---|---|
+| `--out-dir` (`export-window`, `upload-window`) | `default_out_dir`: `output/<TENANT>/<feed>_<YYYYMMDD first>_<YYYYMMDD last>` | `output/HLSTRATEGIESTEST/executions_20261010_20261019` |
+| `--file-prefix` (`export-window`) | `Tenant.file_prefix` | `hlstrategiestest_LINKED_PRIVATE_EXECUTION_V2_10102026_part1.csv` |
+
+The export ledger and the `upload_<TENANT>.done` file live inside that
+folder, so a window of one tenant can never be read as another's.
+`upload-window` refuses a derived folder that does not exist (nothing was
+exported there), and `export-window` without both `--tenant` and
+`--out-dir` is a usage error. Each tenant also has its own upload ledger
+document, `docs/tenants/<TENANT>/HALO_UPLOAD_LEDGER.md`
+(`Tenant.ledger_doc`), indexed by `docs/tenants/README.md`.
+
 ### 8.1 Coverage gate (`coverage.py`)
 
-The upload ledger (`HALO_UPLOAD_LEDGER.md`) only knows about this repo's
-uploads. The tenant's own daily pipeline, manual tests and other people's
+The upload ledger (`docs/tenants/<TENANT>/HALO_UPLOAD_LEDGER.md`) only
+knows about this repo's uploads. The tenant's own daily pipeline, manual tests and other people's
 backfills are invisible to it, which is how May 19 to 21 2026 were
 double-counted. So the tenant is asked first, through the read-only
 `clickhouse-download` skill:
 
 | Query | Table | Grain | Gives |
 |---|---|---|---|
-| `strict_events_sql` | `strict_events` (`exchange = <tenant>`, `event_type = 'EXECUTION'`) | per `toDate(ts)` | rows and `uniqExact(id)` per day |
-| `raw_files_sql` | `raw_realtime_matched_executions` (`solidus_client = <tenant>`) | per `(toDate(transact_time), orig_file)` | the source files behind those rows, with `min`/`max(data_loaded_at)` |
+| `strict_events_sql` | `strict_events` (`exchange = <tenant>`, `event_type = <feed's: 'EXECUTION' or 'ORDER'>`) | per `toDate(ts)` | rows and `uniqExact(id)` per day |
+| `raw_files_sql` | the feed's raw table (`raw_realtime_matched_executions` or `raw_realtime_orders`, `solidus_client = <tenant>`) | per `(toDate(transact_time), orig_file)` | the source files behind those rows, with `min`/`max(data_loaded_at)` |
 
 The tenant name is validated against `^[A-Z0-9_]+$` before it is spliced
 into SQL. The skill writes its result as a CSV file (CRLF on some hosts,
@@ -682,7 +748,11 @@ sends the parts its record names that are not yet listed in
    loses nothing already sent, and the next run skips those names.
 
 Days run in date order; the parts of a day run on a `ThreadPoolExecutor`
-with `workers` threads. With `wait_for_export` (the default) the uploader
+with `workers` threads. `only` (CLI `--only FILE`, repeatable) restricts a
+run to named parts for the sample-first step on a new tenant or feed: the
+selected parts go through the same done-file, and a name no `ok` record of
+the requested days lists is reported as a failed part (`attempts = 0`), so
+a misspelled sample cannot look like a successful run. With `wait_for_export` (the default) the uploader
 polls the export ledger every `poll_seconds` for a day it does not list
 yet, so export and upload can run side by side; with it off such days are
 skipped and reported. `dry_run` computes the plan and calls nothing. The
@@ -707,13 +777,16 @@ interpreter; the tenant API keys stay in the skill's own `.env`.
   `export_to_csv` is replaced by a fake that writes empty parts, and the
   two skills by `subprocess.run` doubles with scripted exit codes, so the
   ledger, the stale-part cleanup, the exit-code-only verdict, the done-file
-  and the CSV parsing all run offline. Run with `pytest` after
+  and the CSV parsing all run offline; `test_cli.py` drives the window
+  commands through click's `CliRunner` to check the tenant-derived folder
+  and prefix. Run with `pytest` after
   `pip install -e ".[dev]"`.
 - **VS Code launch configurations** (`.vscode/launch.json`) cover each
   CLI subcommand for quick debug runs against `.env`, an
-  `--include-ineligible` export, the three window commands (coverage
-  check, a two-day gated export, a dry-run upload), and the SymbolType map
-  sync (its `--source` path is relative to the workspace and assumes the
+  `--include-ineligible` export, the three window commands for each tenant
+  (coverage check, gated export, dry-run upload; the `HLSTRATEGIESTEST`
+  entries rely on the tenant-derived folder and prefix), and the SymbolType
+  map sync (its `--source` path is relative to the workspace and assumes the
   production repo sits at `~/Desktop/defi-hyperliquid-halo`; edit it if
   yours lives elsewhere).
 - **External skills.** The window commands shell out to two Claude Code

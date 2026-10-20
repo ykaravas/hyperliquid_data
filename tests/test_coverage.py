@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hyperliquid_halo import coverage
+from hyperliquid_halo.feeds import ORDERS
 
 STRICT_CSV = (
     "day,rows,distinct_ids\r\n"
@@ -140,3 +141,17 @@ def test_resolve_settings_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv(coverage.SCRIPT_ENV, str(tmp_path / "missing.py"))
     with pytest.raises(coverage.CoverageError, match="not found"):
         coverage.resolve_settings()
+
+
+def test_orders_feed_counts_order_rows_and_reads_the_orders_raw_table(tmp_path: Path) -> None:
+    """The orders feed switches the event type, the raw table and the report label."""
+    strict = coverage.strict_events_sql("HLRESEARCH", date(2026, 3, 1), date(2026, 3, 10), ORDERS)
+    raw = coverage.raw_files_sql("HLRESEARCH", date(2026, 3, 1), date(2026, 3, 10), ORDERS)
+    assert "event_type = 'ORDER'" in strict and "event_type = 'EXECUTION'" not in strict
+    assert "FROM raw_realtime_orders " in raw
+    run = _FakeRun()
+    report = coverage.check_coverage("HLRESEARCH", date(2026, 5, 19), date(2026, 5, 20),
+                                     _settings(tmp_path), feed=ORDERS, run=run)
+    assert report.feed == "orders"
+    assert "event_type = 'ORDER'" in run.queries[0]
+    assert coverage.format_report(report).startswith("Tenant HLRESEARCH (orders):")

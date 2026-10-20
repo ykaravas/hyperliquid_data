@@ -311,6 +311,7 @@ def upload_window(
     *,
     wait_for_export: bool = True,
     dry_run: bool = False,
+    only: Sequence[str] | None = None,
     on_event: Callable[[str], None] | None = None,
     run: RunFn = subprocess.run,
     sleep: SleepFn = time.sleep,
@@ -324,6 +325,11 @@ def upload_window(
             yet (the export is still running). When ``False`` such days are
             skipped and reported.
         dry_run: Only compute what would be sent; call nothing.
+        only: Part names to limit the run to (the "send a sample first"
+            step Solidus asks for on a new tenant or feed). Parts not named
+            are left alone and not reported; a name that no ``ok`` record of
+            these days lists is reported as failed, so a typo cannot pass as
+            a successful run. ``None`` sends every part.
         on_event: Optional progress callback receiving one line per event.
         run: ``subprocess.run``-compatible callable (injectable for tests).
         sleep: ``time.sleep``-compatible callable (injectable for tests).
@@ -340,8 +346,11 @@ def upload_window(
     failed: list[PartResult] = []
     skipped: list[DaySkip] = []
     planned: list[str] = []
+    only_set = set(only) if only else None
+    seen_only: set[str] = set()
     notify(f"Upload to {settings.tenant} ({settings.region}, {settings.file_type}); "
-           f"{len(done)} part(s) already recorded in {done_path.name}")
+           f"{len(done)} part(s) already recorded in {done_path.name}"
+           + (f"; limited to {len(only_set)} named part(s)" if only_set else ""))
 
     for day in days:
         record = _wait_for_record(settings, day, wait=wait_for_export, sleep=sleep, on_event=notify)
@@ -353,9 +362,12 @@ def upload_window(
             skipped.append(DaySkip(day, f"export {record.status}"))
             notify(f"{day}: SKIPPED, export status {record.status}")
             continue
-        todo = [name for name in record.parts if name not in done]
-        already.extend(name for name in record.parts if name in done)
-        notify(f"{day}: {len(record.parts)} part(s), {len(todo)} to send")
+        selected = [name for name in record.parts if only_set is None or name in only_set]
+        seen_only.update(selected)
+        todo = [name for name in selected if name not in done]
+        already.extend(name for name in selected if name in done)
+        notify(f"{day}: {len(record.parts)} part(s), {len(todo)} to send"
+               + (f" ({len(selected)} selected by --only)" if only_set is not None else ""))
         if dry_run:
             planned.extend(todo)
             continue
@@ -379,5 +391,10 @@ def upload_window(
         notify(f"{day}: uploaded {len(todo) - len(day_failed)}/{len(todo)}"
                + (f", FAILED {', '.join(day_failed)}" if day_failed else ""))
 
+    if only_set is not None:
+        for name in sorted(only_set - seen_only):
+            failed.append(PartResult(name=name, ok=False, attempts=0,
+                                     detail="not listed by any ok export record of these days"))
+            notify(f"--only {name}: not in the export ledger for these days")
     return UploadSummary(sent=tuple(sent), already_done=tuple(already), failed=tuple(failed),
                          skipped_days=tuple(skipped), planned=tuple(planned))

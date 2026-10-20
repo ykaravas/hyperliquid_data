@@ -20,6 +20,11 @@ that lives so it is never re-written by hand for each window:
 * **The tenant coverage gate** lives in :mod:`hyperliquid_halo.coverage`;
   the CLI runs it before calling :func:`export_window` so a day that is
   already on the tenant is never exported by accident.
+* **Two feeds, one procedure.** A :class:`~hyperliquid_halo.feeds.Feed`
+  selects the exporter and the HALO file type: executions
+  (``LINKED_PRIVATE_EXECUTION_V2`` parts with aux parts under ``aux/``) or
+  orders (``PRIVATE_ORDER_V2`` parts with one ``aux_orders_DDMMYYYY.csv``
+  per day). Both feeds can be limited to a list of markets.
 
 Parts are capped at :data:`DEFAULT_WINDOW_PART_MB` (499 MB) rather than the
 exporter's production default of 250 MB: fewer, larger files upload faster
@@ -32,15 +37,18 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
 
 from .dq import DqFailure
-from .exporter import DEFAULT_FILE_PREFIX, HALO_FILE_TYPE, export_to_csv
+from .exporter import DEFAULT_FILE_PREFIX, export_to_csv
+from .feeds import EXECUTIONS, ORDERS, Feed
 from .mapping import QueryParams
+from .orders_exporter import export_orders_to_csv
+from .orders_mapping import OrdersQueryParams
 
 logger = logging.getLogger(__name__)
 
@@ -200,44 +208,59 @@ def part_number(name: str) -> int:
     return int(match.group(1))
 
 
-def part_glob(day: date, file_prefix: str = DEFAULT_FILE_PREFIX) -> str:
+def part_glob(day: date, file_prefix: str = DEFAULT_FILE_PREFIX, feed: Feed = EXECUTIONS) -> str:
     """Glob matching every HALO part of ``day`` (production's ``DDMMYYYY`` naming)."""
-    return f"{file_prefix}_{HALO_FILE_TYPE}_{day:%d%m%Y}_part*.csv"
+    return f"{file_prefix}_{feed.file_type}_{day:%d%m%Y}_part*.csv"
 
 
-def day_parts(out_dir: Path, day: date, file_prefix: str = DEFAULT_FILE_PREFIX) -> list[Path]:
+def orders_aux_filename(day: date) -> str:
+    """Name of the single aux file an orders day writes next to its parts."""
+    return f"aux_orders_{day:%d%m%Y}.csv"
+
+
+def day_parts(
+    out_dir: Path, day: date, file_prefix: str = DEFAULT_FILE_PREFIX, feed: Feed = EXECUTIONS
+) -> list[Path]:
     """HALO part files of ``day`` present on disk, sorted by part number.
 
     Sorting is numeric so ``part10`` follows ``part9`` rather than ``part1``.
     """
-    return sorted(out_dir.glob(part_glob(day, file_prefix)), key=lambda p: part_number(p.name))
+    return sorted(out_dir.glob(part_glob(day, file_prefix, feed)),
+                  key=lambda p: part_number(p.name))
 
 
-def remove_stale_parts(out_dir: Path, day: date, file_prefix: str = DEFAULT_FILE_PREFIX) -> int:
-    """Delete every HALO and aux part of ``day`` left behind by an earlier attempt.
+def remove_stale_parts(
+    out_dir: Path, day: date, file_prefix: str = DEFAULT_FILE_PREFIX, feed: Feed = EXECUTIONS
+) -> int:
+    """Delete every HALO and aux file of ``day`` left behind by an earlier attempt.
 
     Called before a day is (re-)exported so the folder never holds parts
     from two attempts (an interrupted export can leave a partial trailing
     part; a re-export that rolls parts differently would otherwise leave an
-    orphan with a higher part number).
+    orphan with a higher part number). For executions the aux parts under
+    ``aux/`` go too; for orders the day's single aux file does.
 
     Args:
         out_dir: Output directory.
         day: Transact date whose parts to remove.
         file_prefix: Part-name prefix used by the export.
+        feed: Which feed's files to look for.
 
     Returns:
-        Number of files removed (HALO and aux parts together).
+        Number of files removed (HALO and aux together).
     """
-    removed = 0
-    for path in list(day_parts(out_dir, day, file_prefix)) + list(
-        (out_dir / "aux").glob(part_glob(day, file_prefix))
-    ):
+    stale = list(day_parts(out_dir, day, file_prefix, feed))
+    if feed is ORDERS:
+        aux = out_dir / orders_aux_filename(day)
+        if aux.exists():
+            stale.append(aux)
+    else:
+        stale.extend((out_dir / "aux").glob(part_glob(day, file_prefix, feed)))
+    for path in stale:
         path.unlink()
-        removed += 1
-    if removed:
-        logger.warning("Removed %d stale part file(s) for %s before re-export", removed, day)
-    return removed
+    if stale:
+        logger.warning("Removed %d stale file(s) for %s before re-export", len(stale), day)
+    return len(stale)
 
 
 def iter_days(start: date, end_exclusive: date) -> Iterator[date]:
@@ -259,6 +282,9 @@ def export_day(
     *,
     max_part_mb: float = DEFAULT_WINDOW_PART_MB,
     file_prefix: str = DEFAULT_FILE_PREFIX,
+    feed: Feed = EXECUTIONS,
+    coins: Sequence[str] | None = None,
+    include_post_only: bool = False,
 ) -> DayRecord:
     """Export one day in HALO-strict mode and describe the outcome.
 
@@ -272,15 +298,33 @@ def export_day(
         out_dir: Output directory; parts are written directly into it.
         max_part_mb: Per-part size cap in MB.
         file_prefix: Part-name prefix (production uses the tenant name).
+        feed: Executions (the default) or orders.
+        coins: Optional list of Allium ``COIN`` values to limit the day to.
+        include_post_only: Orders only: keep the post-only (``Alo``)
+            quoting rows, which the orders exporter drops by default.
 
     Returns:
         The :class:`DayRecord` for the day (not yet written to the ledger).
     """
     started = time.monotonic()
-    remove_stale_parts(out_dir, day, file_prefix)
-    params = QueryParams(start_ts=_utc_midnight(day), end_ts=_utc_midnight(day + timedelta(days=1)),
-                         halo_strict=True)
+    remove_stale_parts(out_dir, day, file_prefix, feed)
+    start_ts, end_ts = _utc_midnight(day), _utc_midnight(day + timedelta(days=1))
+    coin_filter = tuple(coins) if coins else None
     try:
+        if feed is ORDERS:
+            orders_params = OrdersQueryParams(start_ts=start_ts, end_ts=end_ts, coin=coin_filter,
+                                              exclude_post_only=not include_post_only)
+            orders_result = export_orders_to_csv(
+                orders_params, out_dir=out_dir, aux_filename=orders_aux_filename(day),
+                halo_strict=True, max_part_mb=max_part_mb, file_prefix=file_prefix,
+            )
+            parts = tuple(p.name for p in orders_result.halo_paths)
+            logger.info("Exported %s orders: %d rows in %d part(s); %d sized from position, "
+                        "%d withheld at OrderQty 0", day, orders_result.row_count, len(parts),
+                        orders_result.sized_from_position_rows, orders_result.zero_qty_rows)
+            return DayRecord(day=day, status=STATUS_OK, rows=orders_result.row_count, parts=parts,
+                             finished_at=_now_iso(), seconds=time.monotonic() - started)
+        params = QueryParams(start_ts=start_ts, end_ts=end_ts, coin=coin_filter, halo_strict=True)
         result = export_to_csv(params, out_dir=out_dir, max_part_mb=max_part_mb,
                                file_prefix=file_prefix)
     except DqFailure as exc:
@@ -307,6 +351,9 @@ def export_window(
     file_prefix: str = DEFAULT_FILE_PREFIX,
     force: bool = False,
     on_day: Callable[[DayRecord], None] | None = None,
+    feed: Feed = EXECUTIONS,
+    coins: Sequence[str] | None = None,
+    include_post_only: bool = False,
 ) -> WindowResult:
     """Export every day of ``[start, end_exclusive)`` and keep the ledger current.
 
@@ -320,6 +367,9 @@ def export_window(
         on_day: Optional callback invoked with each day's record right
             after it is written to the ledger (the CLI uses it to print
             progress).
+        feed: Executions (the default) or orders; see :func:`export_day`.
+        coins: Optional list of Allium ``COIN`` values to limit every day to.
+        include_post_only: Orders only: keep the post-only quoting rows.
 
     Returns:
         A :class:`WindowResult` listing this run's records and skipped days.
@@ -340,7 +390,8 @@ def export_window(
                         day, earlier.rows, len(earlier.parts))
             skipped.append(day)
             continue
-        record = export_day(day, out_dir, max_part_mb=max_part_mb, file_prefix=file_prefix)
+        record = export_day(day, out_dir, max_part_mb=max_part_mb, file_prefix=file_prefix,
+                            feed=feed, coins=coins, include_post_only=include_post_only)
         append_status(out_dir, record)
         records.append(record)
         if on_day is not None:

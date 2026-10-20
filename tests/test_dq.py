@@ -149,13 +149,13 @@ def test_dq9_warns_without_failing_and_names_symbols() -> None:
         + _trade("t2", symbol="PONS/USDC", symbol_type=None)
         + _trade("t3", symbol="NEWCOIN/USDC", symbol_type="")
         + _trade("t4", symbol="HYPE/USDC", security_type="SPOT", position_effect=None,
-                 symbol_type=None, direction="Buy")  # spot never counts
+                 symbol_type=None, direction="Buy")  # spot counts too since 2026-10-20
     )
     report = _run(rows)
     assert report.ok, "DQ-9 must not block"
     dq9 = next(r for r in report.results if r.check == "DQ-9")
     assert dq9.status == "WARN"
-    assert dq9.observed["rows"] == 6 and dq9.observed["trades"] == 3
+    assert dq9.observed["rows"] == 8 and dq9.observed["trades"] == 4
     assert dq9.observed["top_symbols"][0] == {"symbol": "PONS/USDC", "rows": 4}
     assert "PONS/USDC 4" in (dq9.summary or "")
     assert "sync_symbol_type_map" in (dq9.summary or "")

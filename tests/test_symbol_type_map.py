@@ -87,11 +87,12 @@ def test_sync_writes_importable_module(tmp_path: Path) -> None:
     namespace: dict[str, object] = {}
     exec(compile(output.read_text(encoding="utf-8"), str(output), "exec"), namespace)
     generated = namespace["SYMBOL_TYPE_MAP"]
+    # sync() sorts the rows (production writes two sorted blocks, perps then spot).
     assert generated == (
         ("BTC", "Crypto"),
         ("DOGE", "Memecoin"),
-        ("xyz:TSLA", "Equity"),
         ("hyna:1000PEPE", "Memecoin"),
+        ("xyz:TSLA", "Equity"),
     )
     render = namespace["render_values_rows"]
     assert callable(render)

@@ -153,17 +153,24 @@ def test_oco_pairing_and_stoppx_come_from_the_armed_orders_lookback(
     assert "LAST_VALUE" not in sql
 
 
-def test_exclude_post_only_adds_the_tif_predicate(base_params: OrdersQueryParams) -> None:
-    """Post-only quoting is dropped only on request; NULL-TIF trigger rows always stay."""
+def test_post_only_is_excluded_by_default(base_params: OrdersQueryParams) -> None:
+    """Post-only quoting is dropped unless asked for; NULL-TIF trigger rows always stay."""
+    assert base_params.exclude_post_only is True
     sql, _ = build_orders_query(base_params)
-    assert "TIME_IN_FORCE <> 'Alo'" not in sql
-    params = OrdersQueryParams(
-        start_ts=base_params.start_ts, end_ts=base_params.end_ts, exclude_post_only=True
-    )
-    sql, _ = build_orders_query(params)
     assert "AND (TIME_IN_FORCE IS NULL OR TIME_IN_FORCE <> 'Alo')" in sql
     # The predicate belongs to the day's rows, not to the armed_orders lookback.
     assert sql.index("TIME_IN_FORCE <> 'Alo'") < sql.index("armed_orders AS (")
+
+
+def test_include_post_only_removes_the_tif_predicate(base_params: OrdersQueryParams) -> None:
+    """``exclude_post_only=False`` exports the quoting traffic too, still mapped to PostOnly."""
+    params = OrdersQueryParams(
+        start_ts=base_params.start_ts, end_ts=base_params.end_ts, exclude_post_only=False
+    )
+    sql, _ = build_orders_query(params)
+    assert "TIME_IN_FORCE <> 'Alo'" not in sql
+    assert "CASE WHEN TIME_IN_FORCE = 'Alo' THEN 'PostOnly' ELSE 'RegularTrade' END" in sql
+    assert "WHEN 'Alo' THEN 'GoodTillCancel'" in sql
 
 
 def test_trigger_lookback_default_and_validation() -> None:
@@ -208,6 +215,23 @@ def test_build_query_adds_coin_filter() -> None:
     sql, binds = build_orders_query(params)
     assert "AND COIN = %(coin)s" in sql
     assert binds["coin"] == "BTC"
+
+
+def test_build_query_accepts_several_coins() -> None:
+    """A sequence of markets renders COIN IN (...) with one bind per market."""
+    params = OrdersQueryParams(
+        start_ts=datetime(2026, 3, 1, tzinfo=UTC),
+        end_ts=datetime(2026, 3, 2, tzinfo=UTC),
+        coin=("xyz:CL", "xyz:BRENTOIL", "xyz:NATGAS"),
+    )
+    sql, binds = build_orders_query(params)
+    assert "AND COIN IN (%(coin_0)s, %(coin_1)s, %(coin_2)s)" in sql
+    assert "AND COIN = %(coin)s" not in sql
+    assert [binds[f"coin_{i}"] for i in range(3)] == ["xyz:CL", "xyz:BRENTOIL", "xyz:NATGAS"]
+    # One market in a sequence keeps the single-market form.
+    single = OrdersQueryParams(start_ts=params.start_ts, end_ts=params.end_ts, coin=("BTC",))
+    sql, binds = build_orders_query(single)
+    assert "AND COIN = %(coin)s" in sql and binds["coin"] == "BTC"
 
 
 def test_build_query_market_type_spot_uses_coin_shape_inference() -> None:
@@ -316,8 +340,11 @@ def test_blockchain_and_symbol_type_match_executions_feed() -> None:
     assert "'hyperliquid'" not in sql
     assert "symbol_type_map AS (" in sql
     assert "('BTC', 'Crypto')" in sql
-    assert "LEFT JOIN symbol_type_map m ON m.map_coin = o.COIN" in sql
-    assert "THEN 'Crypto' ELSE m.symbol_type END" in sql
+    # Perps join by COIN, '@N' spot orders by the pair name spot_pairs resolved
+    # (production orders R__04); every row takes the map value with no fallback.
+    assert ("ON m.map_coin = IFF(o.COIN LIKE '@%%', sp.token_a || '/' || sp.token_b, o.COIN)"
+            in sql)
+    assert "m.symbol_type" in sql and "THEN 'Crypto'" not in sql
     symbol_type_pos = HALO_ORDER_COLUMNS.index("SymbolType")
     assert symbol_type_pos == HALO_ORDER_COLUMNS.index("ContractMultiplier") + 1
 

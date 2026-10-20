@@ -140,10 +140,13 @@ def test_build_query_embeds_symbol_type_map(base_params: QueryParams) -> None:
     sql, _ = build_query(base_params)
     assert "symbol_type_map AS (" in sql
     assert "('BTC', 'Crypto')" in sql
-    assert "LEFT JOIN symbol_type_map m ON m.map_coin = e.COIN" in sql
-    # Spot is always Crypto; perps take the map value with no fallback.
-    assert "WHEN e.MARKET_TYPE = 'spot' THEN 'Crypto'" in sql
-    assert "ELSE m.symbol_type" in sql
+    # Perps join by COIN, spot by the BASE/QUOTE pair name (production R__07,
+    # 2026-10-13); every row takes the map value with no fallback.
+    assert "ON m.map_coin = IFF(e.MARKET_TYPE = 'spot'," in sql
+    assert "e.TOKEN_A_SYMBOL || '/' || e.TOKEN_B_SYMBOL," in sql
+    assert "m.symbol_type AS symbol_type_str" in sql
+    assert "THEN 'Crypto'" not in sql
+    assert "('HYPE/USDC', 'Crypto')" in sql, "the mirror must carry the spot block"
 
 
 def test_build_query_ids_and_order_ids(base_params: QueryParams) -> None:
@@ -209,3 +212,16 @@ def test_halo_columns_match_v21_required_set() -> None:
     }
     missing = required - set(HALO_COLUMNS)
     assert not missing, f"HALO_COLUMNS missing required fields: {missing}"
+
+
+def test_build_query_accepts_several_coins() -> None:
+    """A sequence of markets renders COIN IN (...) with one bind per market."""
+    params = QueryParams(
+        start_ts=datetime(2026, 3, 1, tzinfo=UTC),
+        end_ts=datetime(2026, 3, 10, tzinfo=UTC),
+        coin=("xyz:CL", "xyz:BRENTOIL", "xyz:NATGAS"),
+    )
+    sql, binds = build_query(params)
+    assert "AND COIN IN (%(coin_0)s, %(coin_1)s, %(coin_2)s)" in sql
+    assert "AND COIN = %(coin)s" not in sql
+    assert [binds[f"coin_{i}"] for i in range(3)] == ["xyz:CL", "xyz:BRENTOIL", "xyz:NATGAS"]

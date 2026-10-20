@@ -44,7 +44,7 @@ two sides of a given trade.
 | `ExchangeSymbol`      | `Hyperliquid:{PAIR}` (falls back to `{COIN}`; for perps `PAIR` equals `COIN`, e.g. `Hyperliquid:BTC`, `Hyperliquid:xyz:CL`) | `Hyperliquid:{PAIR}` (`Hyperliquid:HYPE/USDC`) |
 | `ContractMultiplier`  | `'1'` (required for SWAP)              | `NULL`                                             |
 | `PositionEffect`      | `OPEN` / `CLOSE` derived from `{side}_DIR` | `NULL` (not applicable; HALO stores an empty position effect, see §2.1) |
-| `SymbolType`          | Per-market value from the seeded map (§2.4); `NULL` when the market is not in the map | `Crypto` always (Hyperliquid spot is crypto-only) |
+| `SymbolType`          | Per-market value from the seeded map (§2.4), keyed by `COIN`; `NULL` when the market is not in the map | Per-pair value from the same map, keyed by `TOKEN_A/TOKEN_B` (since 2026-10-20; `Crypto` always before); `NULL` when the pair is not in the map |
 
 `Symbol` is identical across market types — `SecurityType` (`SWAP` vs
 `SPOT`) is what distinguishes them downstream. HALO caps `Symbol` at 41
@@ -139,24 +139,41 @@ collided across dexes.
 ### 2.4 SymbolType comes from the production map
 
 `SymbolType` is an optional HALO enum (orders and executions share one
-list). Spot rows always emit `Crypto`: Hyperliquid spot is crypto-only, a
-structural fact rather than a guess. Perp rows take the curated
-per-market value from `src/hyperliquid_halo/symbol_type_map.py`, a
-generated mirror of production's `R__06b_symbol_type_map.sql` (524
-markets as of the 2026-09-21 workbook refresh, keyed by the Allium `COIN`
-value: `BTC`, `xyz:TSLA`; values used: Crypto, Memecoin, Stablecoin,
-Equity, Commodities, FX, FixedIncome, Exotics). Production generates that
-SQL from the "All Markets" sheet of `hyperliquid_perps_universe.xlsx`
-(research repo `hyperliquid_universe`), whose `SymbolType` column is
+list). Every row, perp or spot, takes the curated per-market value from
+`src/hyperliquid_halo/symbol_type_map.py`, a generated mirror of
+production's `R__06b_symbol_type_map.sql` (880 markets as of the
+2026-10-20 workbook snapshots: 544 perps keyed by the Allium `COIN` value,
+`BTC`, `xyz:TSLA`, and 336 spot pairs keyed by the `BASE/QUOTE` pair name,
+`HYPE/USDC`, `XAUT0/USDT0`, the same string the `Symbol` column carries;
+values used: Crypto, Memecoin, Stablecoin, Equity, Commodities, FX,
+FixedIncome, Exotics for perps and TokenizedEquity for spot). Production
+generates that SQL from the "All Markets" sheets of
+`hyperliquid_perps_universe.xlsx` and `hyperliquid_spot_universe.xlsx`
+(research repo `hyperliquid_universe`), whose `SymbolType` columns are
 derived from the curated Asset Class by `src/apply_halo_annotations.py`.
-The mirror was checked ticker-for-ticker against both on 2026-09-21.
+The join key is `IFF(MARKET_TYPE = 'spot', TOKEN_A_SYMBOL || '/' ||
+TOKEN_B_SYMBOL, COIN)`, production's expression verbatim.
 
-A perp missing from the map emits `NULL` (empty in the CSV) and nothing
+Until 2026-10-13 (production) and 2026-10-20 (this exporter) spot rows
+emitted `Crypto` unconditionally. The spot workbook shows that was wrong
+for about two thirds of the pairs, which are memecoins, tokenized stocks,
+stablecoins, gold or FX. Note that production's change sits on the
+`yk_hl_orders_limited` branch of `defi-hyperliquid-halo` and was not on
+`origin/main` on 2026-10-20: the deployed daily pipeline (what `HLRESEARCH`
+receives) still shipped spot as `Crypto` and an older perp map that day,
+so files from this exporter and from the deployed pipeline differ on
+`SymbolType` until that branch is merged and deployed.
+
+A market missing from the map emits `NULL` (empty in the CSV) and nothing
 else, per production policy: no guessed fallback, anything that does not
 map cleanly stays uncategorized until the map is regenerated. The map is
 a snapshot and goes stale within weeks (the 2026-08-23 map missed 16
 markets that traded in September, about 6% of perp trades, mostly
-`PONS`; the 2026-09-21 refresh covers them). Production's DQ-9 and this
+`PONS`; the 2026-09-21 map missed 11 markets that traded in October,
+about 0.75% of rows, mostly `io:PRL` and `para:PAPER`; the 2026-10-12
+refresh covered all but `para:PAPER`, which the 2026-10-20 refresh added
+together with every other market listed since, checked against all
+markets traded in the prior 30 days). Production's DQ-9 and this
 exporter's mirror of it (§2.6) warn, without blocking, whenever a batch
 carries perp rows with an empty `SymbolType`, naming the symbols to add.
 Regenerate with:
@@ -240,7 +257,7 @@ severities:
 | DQ-6 | `PositionEffect` NULL only on SPOT rows or flips | FAIL |
 | DQ-7 | every direction in the known-eligible set (`Open/Close Long/Short`, flips, `Settlement`, `Buy`, `Sell`); NULL fails | FAIL |
 | DQ-8 | HIP-3 symbols match `-[A-Z]+/`; both sides of a trade agree on `Symbol` | FAIL |
-| DQ-9 | no SWAP rows with an empty `SymbolType` (map is current); names the top unmapped symbols | WARN |
+| DQ-9 | no rows with an empty `SymbolType`, perp or spot (map is current); names the top unmapped symbols. Counted SWAP rows only until 2026-10-20, when spot started reading the map | WARN |
 
 Under `--halo-strict` a FAIL removes both files and exits non-zero with
 the failure payload, the equivalent of production's "DQ fails, nothing
@@ -284,7 +301,7 @@ sides of a trade are adjacent.
 | `ExchangeSymbol`            | see §2                                       | |
 | `PositionEffect`            | see §2.1                                     | |
 | `ContractMultiplier`        | see §2                                       | |
-| `SymbolType`                | see §2.4                                     | Optional HALO enum. `Crypto` for spot; per-market map value for perps; empty when unmapped. |
+| `SymbolType`                | see §2.4                                     | Optional HALO enum. Per-market map value for perps (by `COIN`) and spot (by pair name); empty when unmapped. |
 | `IsMaker`                   | `NOT {side}_CROSSED`                         | **Non-HALO column, default mode only.** `True` when the `Account` side rested passively (maker); `False` when it crossed the spread (taker). Refers to `Account`, not `MatchingAccount`. HALO ignores unknown columns. Dropped from `halo.csv` under `--halo-strict` (§3.2); aux `_IsTaker` keeps the flag. |
 
 Sell side mirrors the above with `BUYER_*` / `SELLER_*` swapped and
@@ -376,7 +393,7 @@ Aligned items were verified by running both exporters end to end against
 | Eligibility gate | `hyperliquid_v_source_eligible` | Same predicates, on by default; `--include-ineligible` turns it off | Aligned (2026-09-21) |
 | `Id` / `MatchingID` | `REPLACE(UNIQUE_ID,' ','T') \|\| '-B'/'-S'` | Same | Aligned (2026-08-24) |
 | `Symbol` | `TOKEN_A/TOKEN_B`; HIP-3 `TOKEN_A-DEX/TOKEN_B` | Same | Aligned (2026-09-21) |
-| `SymbolType` | 524-row seeded map (2026-09-21 refresh); spot `Crypto`; unmapped perps empty | Same map, mirrored by `sync_symbol_type_map` | Aligned (2026-09-21, checked against the workbook) |
+| `SymbolType` | 880-row seeded map (2026-10-20 snapshots, 544 perps by `COIN` + 336 spot pairs by pair name); unmapped markets empty | Same map, mirrored by `sync_symbol_type_map`; same `IFF` join key | Aligned with the repo's `yk_hl_orders_limited` branch (2026-10-20); the deployed pipeline still ran the older map and spot `Crypto` that day, see §2.4 |
 | `PositionEffect` | OPEN / CLOSE / Settlement→CLOSE; NULL otherwise, no defaulting | Same | Aligned (2026-08-24) |
 | `Blockchain` | `ethereum` | Same | Aligned (2026-08-24) |
 | `ExchangeSymbol`, `ContractMultiplier`, `ParentOrderId`, constants | as documented in §3 | Same | Aligned |

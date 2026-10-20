@@ -16,7 +16,10 @@ import pytest
 from hyperliquid_halo import window
 from hyperliquid_halo.dq import DqFailure, DqReport, DqResult, ExecutionDqChecker
 from hyperliquid_halo.exporter import ExportResult
+from hyperliquid_halo.feeds import EXECUTIONS, ORDERS
 from hyperliquid_halo.mapping import QueryParams
+from hyperliquid_halo.orders_exporter import OrdersExportResult
+from hyperliquid_halo.orders_mapping import OrdersQueryParams
 
 
 def _ok_report() -> DqReport:
@@ -180,3 +183,70 @@ def test_part_number_and_invalid_range() -> None:
         window.part_number("halo.csv")
     with pytest.raises(ValueError, match="must be after"):
         window.export_window(date(2026, 5, 5), date(2026, 5, 5), Path("unused"))
+
+
+def _fake_orders_export(parts_per_day: dict[date, int], rows: int = 7) -> Any:
+    """Build an ``export_orders_to_csv`` double writing strict parts and one aux file."""
+    calls: list[OrdersQueryParams] = []
+
+    def fake(params: OrdersQueryParams, out_dir: Path, *, aux_filename: str,
+             halo_strict: bool, max_part_mb: float, file_prefix: str = "sdny",
+             **_: Any) -> OrdersExportResult:
+        calls.append(params)
+        day = params.start_ts.date()
+        assert halo_strict
+        halo_paths: list[Path] = []
+        for number in range(1, parts_per_day[day] + 1):
+            path = out_dir / f"{file_prefix}_PRIVATE_ORDER_V2_{day:%d%m%Y}_part{number}.csv"
+            path.write_text("halo")
+            halo_paths.append(path)
+        aux = out_dir / aux_filename
+        aux.write_text("aux")
+        return OrdersExportResult(halo_path=halo_paths[0], aux_path=aux, row_count=rows,
+                                  halo_paths=tuple(halo_paths), sized_from_position_rows=2,
+                                  zero_qty_rows=1, zero_qty_dropped=True)
+
+    fake.calls = calls  # type: ignore[attr-defined]
+    return fake
+
+
+def test_export_window_orders_feed_writes_order_parts_and_one_aux_per_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The orders feed calls the orders exporter per day with the coins and post-only choice."""
+    fake = _fake_orders_export({date(2026, 3, 1): 1, date(2026, 3, 2): 3})
+    monkeypatch.setattr(window, "export_orders_to_csv", fake)
+    result = window.export_window(date(2026, 3, 1), date(2026, 3, 3), tmp_path, feed=ORDERS,
+                                  coins=["xyz:CL", "xyz:NATGAS"], include_post_only=True)
+
+    assert result.ok
+    ledger = window.read_status(tmp_path)
+    assert ledger[date(2026, 3, 2)].parts == tuple(
+        f"sdny_PRIVATE_ORDER_V2_02032026_part{n}.csv" for n in (1, 2, 3)
+    )
+    assert (tmp_path / "aux_orders_01032026.csv").exists()
+    assert (tmp_path / "aux_orders_02032026.csv").exists()
+    assert not (tmp_path / "aux").exists()
+    params = fake.calls[0]
+    assert params.coin == ("xyz:CL", "xyz:NATGAS")
+    assert params.exclude_post_only is False
+    assert params.start_ts.date() == date(2026, 3, 1)
+
+
+def test_part_glob_and_stale_cleanup_follow_the_feed(tmp_path: Path) -> None:
+    """Orders parts and the day's aux file are cleaned; executions files are left alone."""
+    day = date(2026, 3, 5)
+    assert window.part_glob(day) == "sdny_LINKED_PRIVATE_EXECUTION_V2_05032026_part*.csv"
+    assert window.part_glob(day, feed=ORDERS) == "sdny_PRIVATE_ORDER_V2_05032026_part*.csv"
+    names = (
+        "sdny_PRIVATE_ORDER_V2_05032026_part1.csv",
+        "sdny_PRIVATE_ORDER_V2_05032026_part2.csv",
+        "aux_orders_05032026.csv",
+        "sdny_LINKED_PRIVATE_EXECUTION_V2_05032026_part1.csv",
+    )
+    for name in names:
+        (tmp_path / name).write_text("x")
+    assert window.remove_stale_parts(tmp_path, day, feed=ORDERS) == 3
+    assert (tmp_path / "sdny_LINKED_PRIVATE_EXECUTION_V2_05032026_part1.csv").exists()
+    assert not (tmp_path / "aux_orders_05032026.csv").exists()
+    assert window.remove_stale_parts(tmp_path, day, feed=EXECUTIONS) == 1

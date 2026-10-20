@@ -432,7 +432,7 @@ docs/
     FUNCTIONAL_SPEC.md             # repo-flavored architecture + algorithms (both feeds)
     tenants/README.md              # the tenants: prefix, region, feeds shipped, where each ledger is
     tenants/HLRESEARCH/HALO_UPLOAD_LEDGER.md       # transact dates on HLRESEARCH, open housekeeping, the procedure
-    tenants/HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md # the second tenant: Oct 10 to 19 2026 executions, exported 2026-10-20
+    tenants/HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md # the second tenant: Oct 10 to 19 2026 executions, uploaded 2026-10-20 (one open gap)
     hl_execs_halo_mapping.md       # portable trades -> HALO Execution mapping (field by field)
     hl_orders_halo_mapping.md      # portable orders -> HALO Order mapping (field by field, + §8 decisions)
     solidus_batch_file_upload_instructions.pdf  # Solidus's own upload rules (file types, naming, 500 MB, API flow, batch timing)

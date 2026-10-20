@@ -10,7 +10,7 @@ here when it first receives anything.
 | Tenant | Also known as | Region | Part prefix | Feeds shipped | Ledger |
 |---|---|---|---|---|---|
 | `HLRESEARCH` | `UAT_HYPERLIQUID` | `uat-eu-central-1` | `sdny` (the production pipeline's daily files on this tenant use it) | executions (several 2026 windows), orders (xyz commodities, Feb 27 to Mar 11 2026) | [`HLRESEARCH/HALO_UPLOAD_LEDGER.md`](HLRESEARCH/HALO_UPLOAD_LEDGER.md) |
-| `HLSTRATEGIESTEST` | | `uat-eu-central-1` (confirmed by a read-only login on 2026-10-20) | `hlstrategiestest` | executions, October 10 to 19 2026 (exported 2026-10-20, not yet uploaded) | [`HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md`](HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md) |
+| `HLSTRATEGIESTEST` | | `uat-eu-central-1` (confirmed by a read-only login on 2026-10-20) | `hlstrategiestest` | executions, October 10 to 19 2026 (uploaded and verified 2026-10-20: nine days complete; Oct 17 is short 103,899 rows that HALO's raw-to-strict copy skipped, present in the raw table, open with Solidus) | [`HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md`](HLSTRATEGIESTEST/HALO_UPLOAD_LEDGER.md) |
 
 ## What is kept apart, and where
 

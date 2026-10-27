@@ -25,8 +25,8 @@ in HALO) until the map is regenerated. No guessed fallback. Spot rows were
 ``Crypto`` unconditionally before; most spot pairs are memecoins, tokenized
 stocks, stablecoins, gold or FX, so that constant was wrong for them.
 
-Generated 2026-10-20 from R__06b_symbol_type_map.sql (880 markets: 544 perps,
-336 spot pairs).
+Generated 2026-10-27 from R__06b_symbol_type_map.sql (897 markets: 550 perps,
+347 spot pairs).
 """
 
 from __future__ import annotations
@@ -154,8 +154,17 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('EIGEN', 'Crypto'),
     ('ENA', 'Crypto'),
     ('ENS', 'Crypto'),
+    ('EQAAPL/USDC', 'TokenizedEquity'),
+    ('EQAMZN/USDC', 'TokenizedEquity'),
+    ('EQGOOG/USDC', 'TokenizedEquity'),
+    ('EQMETA/USDC', 'TokenizedEquity'),
+    ('EQMSFT/USDC', 'TokenizedEquity'),
+    ('EQMU/USDC', 'TokenizedEquity'),
+    ('EQNVDA/USDC', 'TokenizedEquity'),
     ('EQQQQ/USDC', 'TokenizedEquity'),
+    ('EQSPCX/USDC', 'TokenizedEquity'),
     ('EQSPY/USDC', 'TokenizedEquity'),
+    ('EQTSLA/USDC', 'TokenizedEquity'),
     ('ETC', 'Crypto'),
     ('ETH', 'Crypto'),
     ('ETHFI', 'Crypto'),
@@ -296,6 +305,7 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('LTC', 'Crypto'),
     ('LTHREE/USDC', 'Crypto'),
     ('LUCKY/USDC', 'Memecoin'),
+    ('LZCC/USDC', 'Crypto'),
     ('MAGA/USDC', 'Memecoin'),
     ('MANLET/USDC', 'Memecoin'),
     ('MANTA', 'Crypto'),
@@ -446,6 +456,7 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('SKHYX/USDC', 'TokenizedEquity'),
     ('SKR', 'Crypto'),
     ('SKY', 'Crypto'),
+    ('SL/USDC', 'Crypto'),
     ('SLAY/USDC', 'Crypto'),
     ('SLV/USDC', 'TokenizedEquity'),
     ('SNDKX/USDC', 'TokenizedEquity'),
@@ -581,6 +592,7 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('XMR1/USDC', 'Crypto'),
     ('XPL', 'Crypto'),
     ('XRP', 'Crypto'),
+    ('XTEN', 'Crypto'),
     ('XULIAN/USDC', 'Memecoin'),
     ('YAP/USDC', 'Crypto'),
     ('YEETI/USDC', 'Memecoin'),
@@ -662,9 +674,11 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('io:IONQ', 'Equity'),
     ('io:MOONSHOT', 'Equity'),
     ('io:NBIS', 'Equity'),
+    ('io:NVDA', 'Equity'),
     ('io:OAI', 'Equity'),
     ('io:PRL', 'Crypto'),
     ('io:SBE', 'Equity'),
+    ('io:SKHX', 'Equity'),
     ('io:SNDK', 'Equity'),
     ('io:TCNT', 'Equity'),
     ('io:XIAOMI', 'Equity'),
@@ -784,6 +798,7 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('xyz:AMD', 'Equity'),
     ('xyz:AMEC', 'Equity'),
     ('xyz:AMZN', 'Equity'),
+    ('xyz:ANT', 'Equity'),
     ('xyz:ARM', 'Equity'),
     ('xyz:ASML', 'Equity'),
     ('xyz:AVGO', 'Equity'),
@@ -856,6 +871,7 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('xyz:MSFT', 'Equity'),
     ('xyz:MSTR', 'Equity'),
     ('xyz:MU', 'Equity'),
+    ('xyz:MUU', 'Equity'),
     ('xyz:NATGAS', 'Commodities'),
     ('xyz:NBIS', 'Equity'),
     ('xyz:NCLD', 'Equity'),
@@ -896,6 +912,7 @@ SYMBOL_TYPE_MAP: tuple[tuple[str, str], ...] = (
     ('xyz:TSLA', 'Equity'),
     ('xyz:TSM', 'Equity'),
     ('xyz:TTF', 'Commodities'),
+    ('xyz:TTWO', 'Equity'),
     ('xyz:TWST', 'Equity'),
     ('xyz:UMC', 'Equity'),
     ('xyz:UNITREE', 'Equity'),

@@ -141,9 +141,9 @@ collided across dexes.
 `SymbolType` is an optional HALO enum (orders and executions share one
 list). Every row, perp or spot, takes the curated per-market value from
 `src/hyperliquid_halo/symbol_type_map.py`, a generated mirror of
-production's `R__06b_symbol_type_map.sql` (880 markets as of the
-2026-10-20 workbook snapshots: 544 perps keyed by the Allium `COIN` value,
-`BTC`, `xyz:TSLA`, and 336 spot pairs keyed by the `BASE/QUOTE` pair name,
+production's `R__06b_symbol_type_map.sql` (897 markets as of the
+2026-10-27 workbook snapshots: 550 perps keyed by the Allium `COIN` value,
+`BTC`, `xyz:TSLA`, and 347 spot pairs keyed by the `BASE/QUOTE` pair name,
 `HYPE/USDC`, `XAUT0/USDT0`, the same string the `Symbol` column carries;
 values used: Crypto, Memecoin, Stablecoin, Equity, Commodities, FX,
 FixedIncome, Exotics for perps and TokenizedEquity for spot). Production
@@ -393,7 +393,7 @@ Aligned items were verified by running both exporters end to end against
 | Eligibility gate | `hyperliquid_v_source_eligible` | Same predicates, on by default; `--include-ineligible` turns it off | Aligned (2026-09-21) |
 | `Id` / `MatchingID` | `REPLACE(UNIQUE_ID,' ','T') \|\| '-B'/'-S'` | Same | Aligned (2026-08-24) |
 | `Symbol` | `TOKEN_A/TOKEN_B`; HIP-3 `TOKEN_A-DEX/TOKEN_B` | Same | Aligned (2026-09-21) |
-| `SymbolType` | 880-row seeded map (2026-10-20 snapshots, 544 perps by `COIN` + 336 spot pairs by pair name); unmapped markets empty | Same map, mirrored by `sync_symbol_type_map`; same `IFF` join key | Aligned with the repo's `yk_hl_orders_limited` branch (2026-10-20); the deployed pipeline still ran the older map and spot `Crypto` that day, see §2.4 |
+| `SymbolType` | 897-row seeded map (2026-10-27 snapshots, 550 perps by `COIN` + 347 spot pairs by pair name); unmapped markets empty | Same map, mirrored by `sync_symbol_type_map`; same `IFF` join key | Aligned with the repo's `yk_hl_poly_symboltype_updates` branch (2026-10-27); the deployed pipeline (`origin/main`) ships the 880-market map of 2026-10-20 until that branch merges, see §2.4 |
 | `PositionEffect` | OPEN / CLOSE / Settlement→CLOSE; NULL otherwise, no defaulting | Same | Aligned (2026-08-24) |
 | `Blockchain` | `ethereum` | Same | Aligned (2026-08-24) |
 | `ExchangeSymbol`, `ContractMultiplier`, `ParentOrderId`, constants | as documented in §3 | Same | Aligned |

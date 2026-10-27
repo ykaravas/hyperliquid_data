@@ -44,8 +44,9 @@ src/hyperliquid_halo/
 └── cli.py                   # click CLI, 7 subcommands wiring the above
 ```
 
-`symbol_type_map.py` is data, not logic: an 880-row `(coin, symbol_type)`
-tuple (544 perps keyed by `COIN`, 336 spot pairs keyed by `BASE/QUOTE`)
+`symbol_type_map.py` is data, not logic: an 897-row `(coin, symbol_type)`
+tuple (550 perps keyed by `COIN`, 347 spot pairs keyed by `BASE/QUOTE`; the
+2026-10-27 workbook snapshots)
 plus a helper that renders it as SQL `VALUES` rows. Both SQL templates
 splice those rows into a `symbol_type_map` CTE and LEFT JOIN it on `COIN`
 for perps and on the pair name for spot, so the lookup happens in
